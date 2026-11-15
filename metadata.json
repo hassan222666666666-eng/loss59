@@ -1,0 +1,10 @@
+{
+  "name": "رفوف - إدارة تعبئة الأرفف",
+  "description": "تطبيق ويب تقدمي (PWA) للهاتف المحمول لإدارة وتوثيق إعادة تعبئة أرفف المتاجر والسوبرماركت بتقنيات التصوير المستمر.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
