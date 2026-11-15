@@ -777,7 +777,7 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
       </div>
 
       {/* Bottom Total Bar */}
-      <div className="px-4 py-2.5 pb-safe bg-white/95 dark:bg-slate-900/95 border-t border-slate-200/80 dark:border-slate-800 shrink-0">
+      <div className="px-4 pt-2.5 pb-[calc(0.625rem+env(safe-area-inset-bottom,0px))] bg-white/95 dark:bg-slate-900/95 border-t border-slate-200/80 dark:border-slate-800 shrink-0">
         <div className="max-w-3xl mx-auto flex items-center justify-between gap-3">
           <div className="flex items-center gap-2.5 min-w-0">
             <span className="text-xs font-bold text-slate-500 dark:text-slate-400">
@@ -893,7 +893,7 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="bg-white dark:bg-slate-900 w-full max-w-md rounded-t-[24px] sm:rounded-[20px] p-4 pb-safe shadow-2xl border border-slate-200 dark:border-slate-800 max-h-[75vh] flex flex-col gap-3"
+            className="bg-white dark:bg-slate-900 w-full max-w-md rounded-t-[24px] sm:rounded-[20px] px-4 pt-4 pb-[calc(1rem+env(safe-area-inset-bottom,0px))] shadow-2xl border border-slate-200 dark:border-slate-800 max-h-[75vh] flex flex-col gap-3"
           >
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
@@ -949,7 +949,7 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="bg-white dark:bg-slate-900 w-full max-w-md rounded-t-[24px] sm:rounded-[20px] p-4 pb-safe shadow-2xl border border-slate-200 dark:border-slate-800 space-y-3"
+            className="bg-white dark:bg-slate-900 w-full max-w-md rounded-t-[24px] sm:rounded-[20px] px-4 pt-4 pb-[calc(1rem+env(safe-area-inset-bottom,0px))] shadow-2xl border border-slate-200 dark:border-slate-800 space-y-3"
           >
             <div className="flex items-center justify-between">
               <h3 className="text-base font-extrabold text-slate-900 dark:text-white">
@@ -1022,7 +1022,7 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
           className="fixed inset-0 z-50 bg-slate-950 flex flex-col select-none"
           dir="rtl"
         >
-          <div className="px-4 py-3 pt-safe flex items-center justify-between bg-slate-950/90 border-b border-slate-800">
+          <div className="px-4 pb-3 pt-[calc(0.75rem+env(safe-area-inset-top,0px))] flex items-center justify-between bg-slate-950/90 border-b border-slate-800">
             <button
               type="button"
               onClick={() => setViewerTarget(null)}

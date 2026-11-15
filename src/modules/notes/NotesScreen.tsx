@@ -300,10 +300,10 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
 
   return (
     <div
-      className="min-h-screen pb-28 bg-[#F7F8FA] dark:bg-slate-950"
+      className="min-h-[100dvh] pb-28 bg-[#F7F8FA] dark:bg-slate-950"
       dir="rtl"
     >
-      <header className="sticky top-0 z-20 bg-[#F7F8FA]/95 dark:bg-slate-950/95 backdrop-blur-md border-b border-slate-200/80 dark:border-slate-800 px-4 pt-4 pb-3">
+      <header className="sticky top-0 z-20 bg-[#F7F8FA]/95 dark:bg-slate-950/95 backdrop-blur-md border-b border-slate-200/80 dark:border-slate-800 px-4 pt-[calc(1rem+env(safe-area-inset-top,0px))] pb-3">
         <div className="max-w-5xl mx-auto space-y-3">
           <div className="flex items-center justify-between gap-2">
             <h1 className="text-xl font-extrabold text-slate-900 dark:text-white">

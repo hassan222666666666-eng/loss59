@@ -23,17 +23,24 @@ export function App() {
   const [refreshSignal, setRefreshSignal] = useState(0);
   const [focusLogPhotoId, setFocusLogPhotoId] = useState<string | null>(null);
 
-  // Follow system dark mode automatically
+  // Follow system dark mode automatically & sync system bar theme-color
   useEffect(() => {
     const mq = window.matchMedia('(prefers-color-scheme: dark)');
     const applyTheme = (isDark: boolean) => {
       document.documentElement.classList.toggle('dark', isDark);
+      const meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) {
+        meta.setAttribute(
+          'content',
+          activeTab === 'capture' || isDark ? '#020617' : '#F7F8FA'
+        );
+      }
     };
     applyTheme(mq.matches);
     const handler = (e: MediaQueryListEvent) => applyTheme(e.matches);
     mq.addEventListener('change', handler);
     return () => mq.removeEventListener('change', handler);
-  }, []);
+  }, [activeTab]);
 
   // Pause heavy AI queue processing while Capture tab is open; resume when leaving it (only if AI enabled)
   useEffect(() => {
@@ -105,7 +112,7 @@ export function App() {
 
   return (
     <div
-      className="min-h-screen bg-[#F7F8FA] dark:bg-slate-950 text-slate-900 dark:text-slate-100"
+      className="min-h-[100dvh] bg-[#F7F8FA] dark:bg-slate-950 text-slate-900 dark:text-slate-100"
       dir="rtl"
     >
       {activeTab === 'capture' && (

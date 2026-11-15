@@ -1065,7 +1065,7 @@ export const PhotoDetailView: React.FC<PhotoDetailViewProps> = ({
         {/* Top Floating Controls Overlay (small semi-transparent solid buttons, NO blur; hidden when tapped empty area) */}
         {(showFloatingControls || addMode || markMode) && (
           <div
-            className="absolute top-0 inset-x-0 z-20 p-3 pt-safe flex items-start justify-between gap-2 pointer-events-none"
+            className="absolute top-0 inset-x-0 z-20 px-3 pb-3 pt-[calc(0.75rem+env(safe-area-inset-top,0px))] flex items-start justify-between gap-2 pointer-events-none"
             onPointerDown={(e) => e.stopPropagation()}
             onPointerUp={(e) => e.stopPropagation()}
           >

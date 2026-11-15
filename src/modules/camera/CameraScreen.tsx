@@ -1134,7 +1134,7 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
 
   return (
     <div
-      className="relative w-full h-[calc(100dvh-68px)] bg-slate-950 overflow-hidden select-none touch-pan-y"
+      className="relative w-full h-[calc(100dvh-68px-env(safe-area-inset-bottom,0px))] bg-slate-950 overflow-hidden select-none touch-pan-y"
       dir="rtl"
       onTouchStart={handleTouchStart}
       onTouchMove={handleTouchMove}
@@ -1230,7 +1230,7 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
       )}
 
       {/* Top Overlay Bar (plain semi-transparent solid backgrounds, no blur/shadow) */}
-      <div className="absolute top-0 inset-x-0 z-20 p-4 pt-safe flex items-center justify-between gap-2">
+      <div className="absolute top-0 inset-x-0 z-20 px-4 pb-4 pt-[calc(1rem+env(safe-area-inset-top,0px))] flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <div className="px-3.5 py-2.5 rounded-2xl bg-black/55 text-white text-sm font-bold flex items-center gap-2">
             <span>التصوير</span>
@@ -1391,7 +1391,7 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
       {/* Preview / Blurry Rejection Modal */}
       {reviewShot && (
         <div
-          className="fixed inset-0 z-50 bg-slate-950 flex flex-col justify-between p-4 pb-safe"
+          className="fixed inset-0 z-50 bg-slate-950 flex flex-col justify-between px-4 pt-[calc(1rem+env(safe-area-inset-top,0px))] pb-[calc(1rem+env(safe-area-inset-bottom,0px))]"
           dir="rtl"
           role="dialog"
           aria-modal="true"
