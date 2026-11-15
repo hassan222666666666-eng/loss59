@@ -33,6 +33,7 @@ import {
   parseNoteLineMath,
 } from './mathParser';
 import { realignLinePhotosAfterEdit } from './linePhotoAlignment';
+import { computeVisualLineNumbers, formatNoteForCopy } from './noteFormat';
 
 interface NoteEditorViewProps {
   note: NoteItem;
@@ -71,6 +72,7 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
   );
 
   const [copiedTotal, setCopiedTotal] = useState(false);
+  const [copiedNote, setCopiedNote] = useState(false);
   const [showCalcSheet, setShowCalcSheet] = useState(false);
   const [calcState, setCalcState] = useState<CalculatorState>({
     expression: '',
@@ -138,19 +140,15 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
   const mathAnalysis = useMemo(() => computeNoteTotal(body), [body]);
 
   // Compute visual margin numbers (never written into note.body)
-  const lineNumbers = useMemo(() => {
-    if (!numberingEnabled) return rawLines.map(() => null);
-    let counter = 1;
-    return rawLines.map((line) => {
-      if (resetAfterBlankLine && line.trim() === '') {
-        counter = 1;
-        return null;
-      }
-      const val = counter;
-      counter++;
-      return val;
-    });
-  }, [rawLines, numberingEnabled, resetAfterBlankLine]);
+  const lineNumbers = useMemo(
+    () =>
+      computeVisualLineNumbers(
+        rawLines,
+        numberingEnabled,
+        resetAfterBlankLine
+      ),
+    [rawLines, numberingEnabled, resetAfterBlankLine]
+  );
 
   const linePhotoMap = useMemo(() => {
     const map = new Map<number, string>();
@@ -276,6 +274,37 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
     } catch {
       // Fallback
     }
+  };
+
+  const handleCopyNote = async () => {
+    const textToCopy = formatNoteForCopy({
+      title,
+      body,
+      numberingEnabled,
+      resetAfterBlankLine,
+    });
+    if (!textToCopy) return;
+
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(textToCopy);
+      } else {
+        throw new Error('Clipboard API unavailable');
+      }
+    } catch {
+      const temp = document.createElement('textarea');
+      temp.value = textToCopy;
+      temp.setAttribute('readonly', '');
+      temp.style.position = 'fixed';
+      temp.style.opacity = '0';
+      document.body.appendChild(temp);
+      temp.select();
+      document.execCommand('copy');
+      document.body.removeChild(temp);
+    }
+
+    setCopiedNote(true);
+    window.setTimeout(() => setCopiedNote(false), 1800);
   };
 
   const handleCalcKey = (key: string) => {
@@ -457,7 +486,7 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
 
   return (
     <div
-      className="fixed inset-0 bottom-[68px] z-30 bg-[#F7F8FA] dark:bg-slate-950 flex flex-col"
+      className="fixed inset-0 bottom-[calc(68px+env(safe-area-inset-bottom,0px))] z-30 bg-[#F7F8FA] dark:bg-slate-950 flex flex-col"
       dir="rtl"
     >
       {/* Hidden Inputs for Note Attachments */}
@@ -496,7 +525,7 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
       />
 
       {/* Top Toolbar */}
-      <header className="px-3 py-2.5 bg-white/95 dark:bg-slate-900/95 border-b border-slate-200/80 dark:border-slate-800 flex items-center justify-between gap-2 shrink-0">
+      <header className="px-3 pb-2.5 pt-[calc(0.625rem+env(safe-area-inset-top,0px))] bg-white/95 dark:bg-slate-900/95 border-b border-slate-200/80 dark:border-slate-800 flex items-center justify-between gap-2 shrink-0">
         <button
           type="button"
           onClick={async () => {
@@ -580,18 +609,41 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
       {/* Scrollable Editor Body */}
       <div className="flex-1 overflow-y-auto px-4 pt-4 pb-6 space-y-4">
         <div className="max-w-3xl mx-auto space-y-4">
-          <input
-            type="text"
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-            placeholder="عنوان الملاحظة..."
-            className="w-full bg-transparent text-xl font-extrabold text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none"
-          />
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="عنوان الملاحظة..."
+              className="flex-1 min-w-0 bg-transparent text-xl font-extrabold text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none"
+            />
+            <button
+              type="button"
+              onClick={handleCopyNote}
+              disabled={!title.trim() && !body.trim()}
+              className="min-h-[40px] px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 text-slate-700 dark:text-slate-200 font-bold text-xs flex items-center gap-1.5 shrink-0 shadow-sm active:scale-95 transition disabled:opacity-40"
+              aria-label="نسخ الملاحظة"
+            >
+              {copiedNote ? (
+                <>
+                  <Check className="w-4 h-4 text-emerald-500" />
+                  <span className="text-emerald-600 dark:text-emerald-400">
+                    تم النسخ
+                  </span>
+                </>
+              ) : (
+                <>
+                  <Copy className="w-4 h-4" />
+                  <span>نسخ الملاحظة</span>
+                </>
+              )}
+            </button>
+          </div>
 
           {/* Editor Card */}
           <div className="relative bg-white dark:bg-slate-900 rounded-[20px] border border-slate-200/80 dark:border-slate-800 shadow-sm p-3">
             {numberingEnabled ? (
-              /* Numbered Lines with Visual Side 56px Picture Slots + Inline Math Results */
+              /* Numbered Lines with Compact 36px Visual Side Picture Slots + Inline Math Results */
               <div className="divide-y divide-slate-100 dark:divide-slate-800/70">
                 {rawLines.map((lineText, idx) => {
                   const num = lineNumbers[idx];
@@ -602,16 +654,16 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
                   return (
                     <div
                       key={idx}
-                      className="flex items-start gap-2.5 py-2 min-h-[68px]"
+                      className="flex items-start gap-2 py-1.5 min-h-[46px]"
                     >
                       {num !== null ? (
                         <>
                           {/* Visual Line Number (never written into note text) */}
-                          <span className="w-6 pt-3 text-xs font-extrabold text-slate-400 tabular-nums text-center shrink-0 select-none">
+                          <span className="w-5 pt-2 text-xs font-extrabold text-slate-400 tabular-nums text-center shrink-0 select-none">
                             {num}.
                           </span>
 
-                          {/* Visual 56px Rounded Square Picture Slot */}
+                          {/* Compact 36px Rounded Square Picture Slot */}
                           {linePic ? (
                             <button
                               type="button"
@@ -638,7 +690,7 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
                                   dataUrl: linePic,
                                 });
                               }}
-                              className="w-[56px] h-[56px] rounded-xl overflow-hidden bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shrink-0 active:scale-95 transition select-none"
+                              className="w-9 h-9 rounded-lg overflow-hidden bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shrink-0 active:scale-95 transition select-none"
                               aria-label="عرض صورة السطر أو حذفها بالضغط المطول"
                             >
                               <img
@@ -651,18 +703,18 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
                             <button
                               type="button"
                               onClick={() => setMenuLineIndex(idx)}
-                              className="w-[56px] h-[56px] rounded-xl border border-dashed border-slate-300 dark:border-slate-700 bg-[#F7F8FA] dark:bg-slate-800/70 text-slate-400 hover:text-emerald-500 hover:border-emerald-400 flex items-center justify-center shrink-0 active:scale-95 transition"
+                              className="w-9 h-9 rounded-lg border border-dashed border-slate-300 dark:border-slate-700 bg-[#F7F8FA] dark:bg-slate-800/70 text-slate-400 hover:text-emerald-500 hover:border-emerald-400 flex items-center justify-center shrink-0 active:scale-95 transition"
                               aria-label="إضافة صورة للسطر"
                             >
-                              <Plus className="w-5 h-5" />
+                              <Plus className="w-4 h-4" />
                             </button>
                           )}
                         </>
                       ) : (
-                        <div className="w-[82px] shrink-0" />
+                        <div className="w-[64px] shrink-0" />
                       )}
 
-                      <div className="flex-1 min-w-0 pt-2 flex items-start gap-2">
+                      <div className="flex-1 min-w-0 pt-1 flex items-start gap-2">
                         <textarea
                           ref={(el) => {
                             lineInputRefs.current[idx] = el;

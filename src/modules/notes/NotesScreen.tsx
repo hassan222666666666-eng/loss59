@@ -27,6 +27,7 @@ import {
 } from '../db';
 import { formatDayHeading, getLocalDateKey } from '../../utils/arabicText';
 import { NoteEditorView } from './NoteEditorView';
+import { formatNoteForCopy } from './noteFormat';
 
 interface NotesScreenProps {
   settings: AppSettings;
@@ -281,16 +282,37 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
     const selected = filteredNotes.filter((n) => selectedNoteIds.has(n.id));
     if (selected.length === 0) return;
     const text = selected
-      .map((n) => [n.title.trim(), n.body.trim()].filter(Boolean).join('\n'))
+      .map((n) =>
+        formatNoteForCopy({
+          title: n.title,
+          body: n.body,
+          numberingEnabled: Boolean(n.numberingEnabled),
+          resetAfterBlankLine: Boolean(n.resetAfterBlankLine),
+        })
+      )
       .filter(Boolean)
       .join('\n\n---\n\n');
     if (!text) return;
     try {
-      await navigator.clipboard.writeText(text);
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        throw new Error('Clipboard API unavailable');
+      }
       setCopiedSelected(true);
       window.setTimeout(() => setCopiedSelected(false), 1800);
     } catch {
-      // Clipboard blocked
+      const temp = document.createElement('textarea');
+      temp.value = text;
+      temp.setAttribute('readonly', '');
+      temp.style.position = 'fixed';
+      temp.style.opacity = '0';
+      document.body.appendChild(temp);
+      temp.select();
+      document.execCommand('copy');
+      document.body.removeChild(temp);
+      setCopiedSelected(true);
+      window.setTimeout(() => setCopiedSelected(false), 1800);
     }
   };
 

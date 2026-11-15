@@ -27,6 +27,7 @@ import {
   parseNoteLineMath,
 } from '../modules/notes/mathParser';
 import { realignLinePhotosAfterEdit } from '../modules/notes/linePhotoAlignment';
+import { formatNoteForCopy } from '../modules/notes/noteFormat';
 import { KnownProduct } from '../types';
 import {
   formatBytesArabic,
@@ -309,5 +310,37 @@ test('getVideoCaptureRotationDeg detects portrait/landscape mismatches and flips
   // Landscape preview with portrait frame -> 270 (or 90 if 270 screen angle)
   assert.equal(getVideoCaptureRotationDeg(1080, 1920, 780, 390, 90), 270);
   assert.equal(getVideoCaptureRotationDeg(1080, 1920, 780, 390, 270), 90);
+});
+
+test('formatNoteForCopy preserves exact order, numbering, and blank-line resets', () => {
+  assert.equal(
+    formatNoteForCopy({
+      title: 'نقص المواد',
+      body: 'كيك سوفلي\nستي كوز\n',
+      numberingEnabled: true,
+      resetAfterBlankLine: false,
+    }),
+    'نقص المواد\n1. كيك سوفلي\n2. ستي كوز'
+  );
+
+  assert.equal(
+    formatNoteForCopy({
+      title: 'مواد اليوم',
+      body: 'حليب\nخبز\n\nعصير\nماء',
+      numberingEnabled: true,
+      resetAfterBlankLine: true,
+    }),
+    'مواد اليوم\n1. حليب\n2. خبز\n\n1. عصير\n2. ماء'
+  );
+
+  assert.equal(
+    formatNoteForCopy({
+      title: 'ملاحظة عادية',
+      body: 'السطر الأول\nالسطر الثاني',
+      numberingEnabled: false,
+      resetAfterBlankLine: false,
+    }),
+    'ملاحظة عادية\nالسطر الأول\nالسطر الثاني'
+  );
 });
 
