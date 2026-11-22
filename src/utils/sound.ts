@@ -3,9 +3,12 @@
  * Zero external audio assets, works completely offline in PWA.
  */
 
+import { isMusicPlayingActive } from '../modules/music/musicPlaybackFlag';
+
 let audioCtx: AudioContext | null = null;
 
 export function warmAudioContext(): void {
+  if (isMusicPlayingActive()) return;
   try {
     const AudioContextClass =
       window.AudioContext ||
@@ -24,6 +27,7 @@ export function warmAudioContext(): void {
 }
 
 export function playShutterSound(): void {
+  if (isMusicPlayingActive()) return;
   try {
     const AudioContextClass =
       window.AudioContext ||

@@ -23,7 +23,7 @@ export default defineConfig(() => {
           id: '/',
           name: 'نقص الرفوف',
           short_name: 'نقص الرفوف',
-          description: 'تطبيق لتصوير نواقص أرفف السوبرماركت، تحديد أماكن النقص، تسجيل الكميات، ومتابعة إحصائيات الاستهلاك.',
+          description: 'تطبيق لتصوير أرفف السوبرماركت، متابعة سجل التعبئة، كتابة الملاحظات والكميات، وتشغيل الصوتيات.',
           theme_color: '#0F172A',
           background_color: '#0F172A',
           display: 'fullscreen',
@@ -109,15 +109,13 @@ export default defineConfig(() => {
           ],
         },
         devOptions: {
-          enabled: true,
-          type: 'module',
-          navigateFallback: 'index.html',
+          enabled: false,
         },
       }),
     ],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, '.'),
+        '@': path.resolve(process.cwd(), '.'),
       },
     },
     server: {

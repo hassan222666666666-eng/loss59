@@ -37,6 +37,32 @@ export function initOfflineServiceWorker(): void {
     return;
   }
 
+  // In development/preview, unregister any stale dev service worker so Vite ES modules are never cached stale across server restarts
+  if (!import.meta.env.PROD) {
+    navigator.serviceWorker
+      .getRegistrations()
+      .then(async (regs) => {
+        let hadDevSw = false;
+        for (const reg of regs) {
+          const url = reg.active?.scriptURL || reg.installing?.scriptURL || reg.waiting?.scriptURL || '';
+          if (url.includes('dev-sw') || url.includes('sw.js')) {
+            hadDevSw = true;
+            await reg.unregister().catch(() => {});
+          }
+        }
+        if (hadDevSw && typeof caches !== 'undefined') {
+          const keys = await caches.keys().catch(() => [] as string[]);
+          await Promise.all(
+            keys
+              .filter((k) => k.includes('workbox') || k.includes('app-runtime'))
+              .map((k) => caches.delete(k).catch(() => false))
+          );
+        }
+      })
+      .catch(() => {});
+    return;
+  }
+
   try {
     updateSWFn = registerSW({
       immediate: true,

@@ -6,18 +6,11 @@ import {
   getVideoCaptureRotationDeg,
 } from '../modules/camera/imageCompression';
 import {
-  LEFT_HALF_SLICE,
-  RIGHT_HALF_SLICE,
-  computeBoxOverlapRatio,
-  mergeDuplicateShortages,
-  remapHalfBoxToFullPhoto,
-  rotateBox90CW,
-  sortShortagesRTLTopToBottom,
-} from '../modules/analysis/boxMerge';
-import {
-  descriptionSimilarity,
-  rankCandidateProductsByDescription,
-} from '../modules/analysis/productMatcher';
+  computeBrightnessMetricsFromRgba,
+  createInitialAutoFlashState,
+  isSceneDimForTorch,
+  stepAutoFlashState,
+} from '../modules/camera/autoFlashDecision';
 import {
   applyCalculatorKey,
   CalculatorState,
@@ -27,8 +20,50 @@ import {
   parseNoteLineMath,
 } from '../modules/notes/mathParser';
 import { realignLinePhotosAfterEdit } from '../modules/notes/linePhotoAlignment';
-import { formatNoteForCopy } from '../modules/notes/noteFormat';
-import { KnownProduct } from '../types';
+import {
+  formatNoteForCopy,
+  formatNoteForWhatsApp,
+  formatNoteWithDetails,
+} from '../modules/notes/noteFormat';
+import {
+  computeNoteQuantitiesSummary,
+  computeToolbarVisibleCount,
+  convertExistingNoteLinesToQuantities,
+  countConvertibleTrailingLines,
+  extractTrailingQuantity,
+  realignLineQuantitiesAfterEdit,
+} from '../modules/notes/quantityLogic';
+import {
+  buildWhatsAppSchemeUrl,
+  buildWhatsAppUrl,
+  isValidWhatsAppPhone,
+  normalizePhoneNumberForWhatsApp,
+  sortRecipientsMostRecentFirst,
+  splitPhoneForEdit,
+} from '../modules/notes/whatsapp';
+import {
+  analyzeFinishedLineDebug,
+  compareNormalizedLineWords,
+  deleteDuplicateLine,
+  deleteDuplicateLinesBulk,
+  findDuplicateForFinishedLine,
+  makeDuplicatePairKey,
+  mergeDuplicateLines,
+  normalizeNoteLineProductName,
+  normalizeNoteLineWords,
+  scanNoteDuplicates,
+} from '../modules/notes/duplicateDetector';
+import { WhatsAppRecipient } from '../types';
+import {
+  LEGACY_AI_CLEANUP_STORAGE_KEY,
+  hasLegacyPhotoAiFields,
+  hasLegacySettingsAiFields,
+  isLegacyAiCleanupDone,
+  markLegacyAiCleanupDone,
+  normalizeImportedBackup,
+  sanitizePhotoRecord,
+  sanitizeSettingsRecord,
+} from '../modules/db/backupSanitizer';
 import {
   formatBytesArabic,
   getCutoffDateKey,
@@ -36,6 +71,86 @@ import {
   normalizeDigits,
   parsePositiveInt,
 } from './arabicText';
+import {
+  CAMERA_RETRY_DELAYS_MS,
+  CAMERA_ZOOM_FOCUS_SETTLE_MS,
+  acquireStreamWithTimeout,
+  buildCameraConstraintAttempts,
+  buildTakePhotoSettings,
+  computeFocusSettleWaitMs,
+  extractContinuousConstraints,
+  extractMaxPhotoDimensions,
+  isCameraBusyOrOverconstrainedError,
+  isCameraPermissionDeniedError,
+  isCameraStartTimeoutError,
+  startCameraWithRetryLadder,
+} from '../modules/camera/cameraStartup';
+import {
+  buildCameraDiagnosticsRows,
+  formatCameraDiagnosticsClipboardText,
+} from '../modules/camera/cameraDiagnostics';
+import {
+  applyUnifiedTrackConstraints,
+  buildUnifiedAdvancedConstraints,
+  createDefaultCameraConstraintState,
+  formatConstraintsError,
+} from '../modules/camera/cameraConstraints';
+import {
+  areVideoDeviceLabelsEmpty,
+  extractZoomRangeFromCapabilities,
+  pickBestTorchCandidate,
+  selectBackCameraCandidates,
+} from '../modules/camera/cameraSelection';
+import {
+  DEFAULT_MUSIC_MAX_STORAGE_MB,
+  MISSING_FILE_LABEL,
+  MUSIC_FAB_COLOR_PRESETS,
+  MUSIC_IDLE_FADE_DELAY_MS,
+  MUSIC_IDLE_OPACITY,
+  SLEEP_TIMER_PRESETS_MIN,
+  buildMusicBackupTracks,
+  canAddAudioBytes,
+  clampFloatingButtonY,
+  computeSleepTimerRemainingSec,
+  deriveShortTrackName,
+  filterPlaylistTracks,
+  filterTracksByTabAndQuery,
+  findMatchingMissingTrack,
+  formatAudioTime,
+  formatMusicImportSummary,
+  formatSleepTimerBadge,
+  getDefaultFloatingButtonY,
+  getRecentPlayedTracks,
+  isBrowserStorageLow,
+  isDuplicateAudioFile,
+  isSupportedAudioFile,
+  isValidRadioUrl,
+  makeAudioDuplicateKey,
+  mergeImportedMusicTracks,
+  pickNextTrackIndex,
+  reorderTrackList,
+  resolveMusicFabColorPreset,
+  stripAudioFileExtension,
+} from '../modules/music/musicLogic';
+import {
+  TRACK_TILE_COLORS,
+  extractEmbeddedCoverArtBytes,
+  getTrackInitialLetter,
+  hashTitleToColorIndex,
+  resolveTrackTileColor,
+} from '../modules/music/coverArt';
+import {
+  formatMediaErrorReason,
+  formatPlaybackDiagnosticsText,
+  resolveAudioMimeType,
+  resolveInitialVolumeReset,
+  resolvePlayVolumeState,
+} from '../modules/music/musicPlaybackHelpers';
+import {
+  isMusicPlayingActive,
+  setMusicPlayingActive,
+} from '../modules/music/musicPlaybackFlag';
+import { MusicTrackRecord } from '../modules/music/types';
 
 test('normalizeDigits & parsePositiveInt handle Arabic-Indic and Latin digits', () => {
   assert.equal(normalizeDigits('١٢٣'), '123');
@@ -61,7 +176,7 @@ test('formatBytesArabic formats storage usage cleanly', () => {
   assert.equal(formatBytesArabic(2 * 1024 * 1024), '2.00 م.ب');
 });
 
-test('calculateTargetDimensions caps longest side accurately for 2048px capture and 256px thumbnails', () => {
+test('calculateTargetDimensions caps longest side accurately and preserves full resolution when maxDim <= 0', () => {
   assert.deepEqual(calculateTargetDimensions(4000, 3000, 2048), {
     width: 2048,
     height: 1536,
@@ -69,6 +184,10 @@ test('calculateTargetDimensions caps longest side accurately for 2048px capture 
   assert.deepEqual(calculateTargetDimensions(512, 512, 256), {
     width: 256,
     height: 256,
+  });
+  assert.deepEqual(calculateTargetDimensions(4000, 3000, 0), {
+    width: 4000,
+    height: 3000,
   });
 });
 
@@ -85,103 +204,6 @@ test('computeLaplacianVariance distinguishes blurry flat region from sharp edge 
     }
   }
   assert.ok(computeLaplacianVariance(sharp, w, h) > 1000);
-});
-
-test('remapHalfBoxToFullPhoto and mergeDuplicateShortages deduplicate >40% overlapping boxes', () => {
-  const leftGap = remapHalfBoxToFullPhoto(
-    { x: 0.75, y: 0.2, w: 0.2, h: 0.25 },
-    LEFT_HALF_SLICE
-  );
-  const rightGap = remapHalfBoxToFullPhoto(
-    { x: 0.1, y: 0.21, w: 0.2, h: 0.24 },
-    RIGHT_HALF_SLICE
-  );
-  assert.ok(computeBoxOverlapRatio(leftGap, rightGap) > 0.4);
-
-  const merged = mergeDuplicateShortages([
-    {
-      productDescription: 'white and blue tall milk carton 1L',
-      gapBox: leftGap,
-      productBox: { x: 0.36, y: 0.2, w: 0.1, h: 0.25 },
-      estimatedMissing: 2,
-      confidence: 0.84,
-    },
-    {
-      productDescription: 'white blue tall milk carton 1L',
-      gapBox: rightGap,
-      productBox: { x: 0.37, y: 0.21, w: 0.1, h: 0.24 },
-      estimatedMissing: 3,
-      confidence: 0.91,
-    },
-    {
-      productDescription: 'orange juice metal can 240ml',
-      gapBox: { x: 0.05, y: 0.2, w: 0.12, h: 0.25 },
-      productBox: { x: 0.18, y: 0.2, w: 0.08, h: 0.25 },
-      estimatedMissing: 1,
-      confidence: 0.88,
-    },
-  ]);
-
-  assert.equal(merged.length, 2);
-  assert.equal(merged[0].estimatedMissing, 3);
-});
-
-test('sortShortagesRTLTopToBottom orders right-to-left within each shelf row and top-to-bottom across rows', () => {
-  const ordered = sortShortagesRTLTopToBottom([
-    { id: 'bottom-left', gapBox: { x: 0.1, y: 0.65, w: 0.1, h: 0.2 } },
-    { id: 'top-left', gapBox: { x: 0.15, y: 0.15, w: 0.1, h: 0.2 } },
-    { id: 'top-right', gapBox: { x: 0.7, y: 0.17, w: 0.1, h: 0.2 } },
-    { id: 'bottom-right', gapBox: { x: 0.72, y: 0.63, w: 0.1, h: 0.2 } },
-  ]);
-
-  assert.deepEqual(
-    ordered.map((x) => x.id),
-    ['top-right', 'top-left', 'bottom-right', 'bottom-left']
-  );
-});
-
-test('rankCandidateProductsByDescription returns up to 6 most visually similar products', () => {
-  const mkProd = (id: string, desc: string, updatedAt: number): KnownProduct => ({
-    id,
-    normalizedName: '',
-    productName: '',
-    productDescription: desc,
-    thumbnailDataUrl: `data:image/jpeg;base64,${id}`,
-    updatedAt,
-  });
-
-  const saved: KnownProduct[] = [
-    mkProd('p1', 'green plastic olive oil bottle gold cap 500ml', 100),
-    mkProd('p2', 'red aluminum soda can silver rim 330ml', 101),
-    mkProd('p3', 'white plastic dairy milk bottle blue cap 1L', 102),
-    mkProd('p4', 'yellow chip bag crispy snack pouch', 103),
-    mkProd('p5', 'clear water plastic bottle blue cap 500ml', 104),
-    mkProd('p6', 'brown glass coffee jar black lid', 105),
-    mkProd('p7', 'red aluminum cola can white stripe 330ml', 106),
-    mkProd('p8', 'purple shampoo bottle flip cap 400ml', 107),
-  ];
-
-  assert.ok(
-    descriptionSimilarity(
-      'red aluminum cola can 330ml',
-      'red aluminum soda can silver rim 330ml'
-    ) >
-      descriptionSimilarity(
-        'red aluminum cola can 330ml',
-        'brown glass coffee jar black lid'
-      )
-  );
-
-  const ranked = rankCandidateProductsByDescription(
-    'red aluminum cola can silver top 330ml',
-    saved,
-    6
-  );
-
-  assert.equal(ranked.length, 6);
-  const topIds = ranked.slice(0, 2).map((p) => p.id);
-  assert.ok(topIds.includes('p2'));
-  assert.ok(topIds.includes('p7'));
 });
 
 test('safe note mathParser evaluates arithmetic, Arabic numerals, labeled lines, and skips dates', () => {
@@ -288,17 +310,6 @@ test('realignLinePhotosAfterEdit keeps side pictures aligned when lines are adde
   ]);
 });
 
-test('rotateBox90CW transforms normalized box coordinates clockwise and returns to origin after 4 turns', () => {
-  const orig = { x: 0.2, y: 0.1, w: 0.3, h: 0.4 };
-  const r1 = rotateBox90CW(orig);
-  assert.deepEqual(r1, { x: 0.5, y: 0.2, w: 0.4, h: 0.3 });
-
-  const r2 = rotateBox90CW(r1);
-  const r3 = rotateBox90CW(r2);
-  const r4 = rotateBox90CW(r3);
-  assert.deepEqual(r4, orig);
-});
-
 test('getVideoCaptureRotationDeg detects portrait/landscape mismatches and flips accurately', () => {
   // Upright portrait preview with landscape sensor frame -> rotate 90 deg CW
   assert.equal(getVideoCaptureRotationDeg(1920, 1080, 390, 780, 0), 90);
@@ -343,4 +354,1488 @@ test('formatNoteForCopy preserves exact order, numbering, and blank-line resets'
     'ملاحظة عادية\nالسطر الأول\nالسطر الثاني'
   );
 });
+
+test('autoFlashDecision detects dim auto-exposed scenes, turns on cleanly, and resists reflection flicker', () => {
+  // Build 16x16 dark RGBA buffer (luma ~55)
+  const darkPixels = new Uint8ClampedArray(16 * 16 * 4);
+  for (let i = 0; i < darkPixels.length; i += 4) {
+    darkPixels[i] = 55;
+    darkPixels[i + 1] = 55;
+    darkPixels[i + 2] = 55;
+    darkPixels[i + 3] = 255;
+  }
+  const darkMetrics = computeBrightnessMetricsFromRgba(darkPixels);
+  assert.equal(isSceneDimForTorch(darkMetrics), true);
+
+  // Auto-exposed dim shelf (avg ~114 with >25% shadows and muted highlights) -> triggers dim assist
+  assert.equal(
+    isSceneDimForTorch({ avgLuma: 114, p90Luma: 140, darkRatio: 0.3 }),
+    true
+  );
+  // Well-lit aisle -> stays off
+  assert.equal(
+    isSceneDimForTorch({ avgLuma: 155, p90Luma: 210, darkRatio: 0.04 }),
+    false
+  );
+
+  // Step state: turns ON after hold time
+  let state = createInitialAutoFlashState(false);
+  let res = stepAutoFlashState(state, darkMetrics, 1000);
+  assert.equal(res.desiredTorch, null);
+  res = stepAutoFlashState(res.nextState, darkMetrics, 1250);
+  assert.equal(res.desiredTorch, true);
+  state = res.nextState;
+
+  // Torch stays ON during 1400ms exposure settle even if reflection spikes bright
+  const brightMetrics = { avgLuma: 180, p90Luma: 220, darkRatio: 0.02 };
+  res = stepAutoFlashState(state, brightMetrics, 2000);
+  assert.equal(res.desiredTorch, null);
+
+  // After settle + 1000ms sustained bright scene, turns OFF cleanly
+  res = stepAutoFlashState(res.nextState, brightMetrics, 2800);
+  assert.equal(res.desiredTorch, null);
+  res = stepAutoFlashState(res.nextState, brightMetrics, 3900);
+  assert.equal(res.desiredTorch, false);
+});
+
+test('formatNoteForWhatsApp removes blank lines, preserves numbering/reset, and optionally appends total', () => {
+  assert.equal(
+    formatNoteForWhatsApp({
+      title: 'طلبية اليوم',
+      body: 'حليب\n\nخبز\n\nعصير\n',
+      numberingEnabled: true,
+      resetAfterBlankLine: true,
+      totalText: '150',
+      includeTotal: false,
+    }),
+    'طلبية اليوم\n1. حليب\n1. خبز\n1. عصير'
+  );
+
+  assert.equal(
+    formatNoteForWhatsApp({
+      body: 'حليب 6 * 12\n\nعصير 3 * 10\n',
+      numberingEnabled: true,
+      resetAfterBlankLine: false,
+      totalText: '102',
+      includeTotal: true,
+    }),
+    '1. حليب 6 * 12\n2. عصير 3 * 10\nالمجموع: 102'
+  );
+});
+
+test('WhatsApp phone normalization defaults +964, removes leading 0, builds wa.me URLs, and sorts recipients by recent use', () => {
+  assert.equal(normalizePhoneNumberForWhatsApp('0770 123 4567'), '9647701234567');
+  assert.equal(normalizePhoneNumberForWhatsApp('7701234567'), '9647701234567');
+  assert.equal(normalizePhoneNumberForWhatsApp('+964 0770-123-4567'), '9647701234567');
+  assert.equal(normalizePhoneNumberForWhatsApp('00964 7701234567'), '9647701234567');
+  assert.equal(normalizePhoneNumberForWhatsApp('٠٧٧٠١٢٣٤٥٦٧'), '9647701234567');
+  assert.equal(normalizePhoneNumberForWhatsApp('0501234567', '+966'), '966501234567');
+
+  assert.equal(isValidWhatsAppPhone('9647701234567'), true);
+  assert.equal(isValidWhatsAppPhone('12345'), false);
+
+  assert.deepEqual(splitPhoneForEdit('9647701234567'), {
+    countryCode: '+964',
+    localNumber: '7701234567',
+  });
+
+  assert.equal(
+    buildWhatsAppUrl('مرحبا\n1. حليب', '9647701234567'),
+    'https://wa.me/9647701234567?text=%D9%85%D8%B1%D8%AD%D8%A8%D8%A7%0A1.%20%D8%AD%D9%84%D9%8A%D8%A8'
+  );
+  assert.equal(buildWhatsAppUrl('مرحبا'), 'https://wa.me/?text=%D9%85%D8%B1%D8%AD%D8%A8%D8%A7');
+  assert.equal(
+    buildWhatsAppSchemeUrl('مرحبا'),
+    'whatsapp://send?text=%D9%85%D8%B1%D8%AD%D8%A8%D8%A7'
+  );
+
+  const list: WhatsAppRecipient[] = [
+    { id: 'a', name: 'أحمد', phone: '9647700000001', lastUsedAt: 1000, createdAt: 500, updatedAt: 1000 },
+    { id: 'b', name: 'سعد', phone: '9647700000002', lastUsedAt: 5000, createdAt: 600, updatedAt: 5000 },
+    { id: 'c', name: 'خالد', phone: '9647700000003', createdAt: 2000, updatedAt: 2000 },
+  ];
+  assert.deepEqual(
+    sortRecipientsMostRecentFirst(list).map((r) => r.id),
+    ['b', 'a', 'c']
+  );
+});
+
+test('duplicateDetector strictly compares word by word, keeps numbers/weights, joins number+unit, and skips digit-only lines', () => {
+  // Normalization: diacritics, tatweel, alef/ya/ta marbuta, Arabic digits, numbering prefix, joined units
+  assert.deepEqual(normalizeNoteLineWords('1. قوطية لحم دجاج ٢٠٠ غ'), [
+    'قوطيه',
+    'لحم',
+    'دجاج',
+    '200غ',
+  ]);
+  assert.deepEqual(normalizeNoteLineWords('2) حليب المراعي ١.٥ لتر'), [
+    'حليب',
+    'المراعي',
+    '1.5لتر',
+  ]);
+  assert.equal(normalizeNoteLineProductName('عمبة باردة'), 'عمبه بارده');
+  assert.equal(normalizeNoteLineProductName('عمبه باردة'), 'عمبه بارده');
+
+  // Lines with NO letters (digits & operators only) normalize to [] and are never compared
+  assert.deepEqual(normalizeNoteLineWords('6 * 12'), []);
+  assert.deepEqual(normalizeNoteLineWords('100 + 25'), []);
+  assert.deepEqual(normalizeNoteLineWords('٤٢'), []);
+
+  // "200غ" and "200 غ" count as the same; "200غ" and "850 غ" are different
+  assert.equal(
+    compareNormalizedLineWords(
+      normalizeNoteLineWords('قوطية لحم دجاج 200غ'),
+      normalizeNoteLineWords('قوطية لحم دجاج ٢٠٠ غ')
+    ).isMatch,
+    true
+  );
+  assert.equal(
+    compareNormalizedLineWords(
+      normalizeNoteLineWords('قوطية لحم دجاج 200غ'),
+      normalizeNoteLineWords('قوطية لحم دجاج 850 غ')
+    ).isMatch,
+    false
+  );
+
+  // Strict word rule: any different, added, or missing word is NOT a duplicate
+  assert.equal(
+    compareNormalizedLineWords(
+      normalizeNoteLineWords('قوطية لحم دجاج 200غ'),
+      normalizeNoteLineWords('قوطية لحم بقري 200غ')
+    ).isMatch,
+    false
+  );
+  assert.equal(
+    compareNormalizedLineWords(
+      normalizeNoteLineWords('دبس رمان زير'),
+      normalizeNoteLineWords('دبس رمان جوكر')
+    ).isMatch,
+    false
+  );
+  assert.equal(
+    compareNormalizedLineWords(
+      normalizeNoteLineWords('شاي ليبتون'),
+      normalizeNoteLineWords('شاي ليبتون احمر')
+    ).isMatch,
+    false
+  );
+
+  // Same set of words with Arabic variants or different word order -> duplicate
+  assert.equal(
+    compareNormalizedLineWords(
+      normalizeNoteLineWords('عمبة باردة'),
+      normalizeNoteLineWords('عمبه باردة')
+    ).isMatch,
+    true
+  );
+  assert.equal(
+    compareNormalizedLineWords(
+      normalizeNoteLineWords('دجاج لحم قوطية 200غ'),
+      normalizeNoteLineWords('قوطية لحم دجاج 200 غ')
+    ).isMatch,
+    true
+  );
+
+  // 1-char typo allowed ONLY inside a single word of >= 5 letters and no differing number/weight
+  const typoMatch = compareNormalizedLineWords(
+    normalizeNoteLineWords('شامبو صانسيلك'),
+    normalizeNoteLineWords('شامبو سانسيلك')
+  );
+  assert.equal(typoMatch.isMatch, true);
+  assert.equal(typoMatch.reason, 'one_char_typo');
+
+  // Short word (< 5 letters) with 1-char difference is NOT allowed ("زير" vs "زيت")
+  assert.equal(
+    compareNormalizedLineWords(
+      normalizeNoteLineWords('دبس رمان زير'),
+      normalizeNoteLineWords('دبس رمان زيت')
+    ).isMatch,
+    false
+  );
+
+  // Digit-only lines never match each other
+  const mathOnly = findDuplicateForFinishedLine({
+    lines: ['6 * 12', '6 * 12'],
+    finishedLineIndex: 1,
+  });
+  assert.equal(mathOnly, null);
+});
+
+test('duplicateDetector finds finished-line duplicates, deletes with aligned photos, respects kept/ignored pairs, and reports words in debug', () => {
+  const matchRes = findDuplicateForFinishedLine({
+    lines: ['عمبة باردة', 'خبز أبيض', 'عَمْبَه بَارِدَةٌ'],
+    finishedLineIndex: 2,
+  });
+  assert.ok(matchRes);
+  assert.equal(matchRes.reason, 'exact_words');
+  assert.equal(matchRes.matchLineIndex, 0);
+  assert.equal(matchRes.matchLineNumber, 1);
+
+  const deleted = deleteDuplicateLine({
+    body: 'عمبة باردة\nخبز أبيض\nعمبه باردة',
+    linePhotos: [
+      { lineIndex: 0, dataUrl: 'p0' },
+      { lineIndex: 1, dataUrl: 'p1' },
+    ],
+    deleteIndex: 2,
+  });
+  assert.equal(deleted.body, 'عمبة باردة\nخبز أبيض');
+  assert.deepEqual(deleted.linePhotos, [
+    { lineIndex: 0, dataUrl: 'p0' },
+    { lineIndex: 1, dataUrl: 'p1' },
+  ]);
+
+  const suppressed = findDuplicateForFinishedLine({
+    lines: ['عمبة باردة', 'خبز أبيض', 'عمبه باردة'],
+    finishedLineIndex: 2,
+    ignoredPairKeys: new Set<string>([matchRes.pairKey]),
+  });
+  assert.equal(suppressed, null);
+});
+
+test('scanNoteDuplicates groups strict duplicates cleanly, excludes kept & active line, deletes bulk, and shows compared words in debug', () => {
+  const lines = [
+    'قوطية لحم دجاج 200غ',
+    'قوطية لحم بقري 200غ', // different word ("بقري" vs "دجاج") -> NOT duplicate
+    'قوطية لحم دجاج ٢٠٠ غ', // exact duplicate with 0
+    'دبس رمان زير',
+    'دبس رمان جوكر', // different brand ("جوكر" vs "زير") -> NOT duplicate
+    '6 * 12',
+    'عمبة باردة',
+    'عمبه باردة', // duplicate with 6
+  ];
+
+  // Symmetric pairKey regardless of argument order
+  assert.equal(
+    makeDuplicatePairKey(0, 2, 'قوطيه لحم دجاج 200غ', 'قوطيه لحم دجاج 200غ'),
+    makeDuplicatePairKey(2, 0, 'قوطيه لحم دجاج 200غ', 'قوطيه لحم دجاج 200غ')
+  );
+
+  // Full scan groups [0, 2] and [6, 7]; ignores non-duplicates 1, 3, 4 and math line 5
+  const scan = scanNoteDuplicates({ lines });
+  assert.equal(scan.groups.length, 2);
+  assert.equal(scan.totalExtraDuplicates, 2);
+  assert.deepEqual(
+    scan.groups[0].items.map((it) => it.lineIndex),
+    [0, 2]
+  );
+  assert.deepEqual(
+    scan.groups[1].items.map((it) => it.lineIndex),
+    [6, 7]
+  );
+  assert.equal(scan.duplicateBadgeLineIndices.has(1), false);
+  assert.equal(scan.duplicateBadgeLineIndices.has(3), false);
+  assert.equal(scan.duplicateBadgeLineIndices.has(4), false);
+  assert.equal(scan.duplicateBadgeLineIndices.has(5), false);
+
+  // Keeping group 2 pairs removes group 2 from scan & clears its badges
+  const kept = new Set<string>(scan.groups[1].pairKeys);
+  const afterKeep = scanNoteDuplicates({ lines, keptPairKeys: kept });
+  assert.equal(afterKeep.groups.length, 1);
+  assert.equal(afterKeep.duplicateBadgeLineIndices.has(6), false);
+  assert.equal(afterKeep.duplicateBadgeLineIndices.has(7), false);
+
+  // Excluding active typing line 7 keeps it unflagged mid-typing
+  const whileTypingLine7 = scanNoteDuplicates({ lines, excludeLineIndex: 7 });
+  assert.equal(whileTypingLine7.groups.length, 1);
+
+  // Bulk deleting extra duplicate lines keeps line photos aligned
+  const bulkDel = deleteDuplicateLinesBulk({
+    body: lines.join('\n'),
+    linePhotos: [
+      { lineIndex: 0, dataUrl: 'pic0' },
+      { lineIndex: 6, dataUrl: 'pic6' },
+    ],
+    deleteIndices: [2],
+  });
+  assert.equal(bulkDel.body.split('\n').length, 7);
+  assert.deepEqual(bulkDel.linePhotos, [
+    { lineIndex: 0, dataUrl: 'pic0' },
+    { lineIndex: 5, dataUrl: 'pic6' },
+  ]);
+
+  // Debug diagnostics report compared words and rejection reason
+  const debugMismatch = analyzeFinishedLineDebug({
+    lines,
+    finishedLineIndex: 1,
+  });
+  assert.ok(debugMismatch);
+  assert.deepEqual(debugMismatch.words, ['قوطيه', 'لحم', 'بقري', '200غ']);
+  assert.equal(debugMismatch.closestLineIndex, 0);
+  assert.deepEqual(debugMismatch.closestWords, ['قوطيه', 'لحم', 'دجاج', '200غ']);
+  assert.equal(debugMismatch.isMatch, false);
+
+  const debugMathSkip = analyzeFinishedLineDebug({
+    lines,
+    finishedLineIndex: 5,
+  });
+  assert.ok(debugMathSkip);
+  assert.deepEqual(debugMathSkip.words, []);
+  assert.ok(debugMathSkip.skipReason);
+});
+
+test('cameraStartup constraint ladder, error classifiers, late timeout cleanup, and retry delays behave reliably', async () => {
+  assert.deepEqual([...CAMERA_RETRY_DELAYS_MS], [500, 1000, 2000]);
+  const hqLadder = buildCameraConstraintAttempts(true);
+  assert.equal(hqLadder.length, 4);
+  assert.deepEqual(hqLadder[0], {
+    audio: false,
+    video: {
+      facingMode: { ideal: 'environment' },
+      width: { min: 1280, ideal: 1920 },
+      height: { min: 720, ideal: 1080 },
+      frameRate: { ideal: 30 },
+    },
+  });
+  assert.deepEqual(hqLadder[3], { audio: false, video: true });
+
+  const stdLadder = buildCameraConstraintAttempts(false);
+  assert.deepEqual(stdLadder[0], {
+    audio: false,
+    video: {
+      facingMode: { ideal: 'environment' },
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+      frameRate: { ideal: 30 },
+    },
+  });
+
+  // Photo capabilities max dimensions, takePhoto settings, continuous modes, and zoom settle delay
+  assert.deepEqual(
+    extractMaxPhotoDimensions({
+      imageWidth: { min: 640, max: 4032 },
+      imageHeight: { min: 480, max: 3024 },
+    }),
+    { imageWidth: 4032, imageHeight: 3024 }
+  );
+  assert.deepEqual(
+    extractMaxPhotoDimensions({
+      photoWidth: { min: 640, max: 3840 },
+      photoHeight: { min: 480, max: 2160 },
+    }),
+    { imageWidth: 3840, imageHeight: 2160 }
+  );
+  assert.deepEqual(
+    buildTakePhotoSettings({
+      fillLightMode: 'flash',
+      maxPhotoDims: { imageWidth: 4032, imageHeight: 3024 },
+    }),
+    { fillLightMode: 'flash', imageWidth: 4032, imageHeight: 3024 }
+  );
+  assert.deepEqual(
+    buildTakePhotoSettings({
+      fillLightMode: 'flash',
+      torchActive: true,
+      maxPhotoDims: { imageWidth: 4032, imageHeight: 3024 },
+    }),
+    { imageWidth: 4032, imageHeight: 3024 }
+  );
+  assert.equal(buildTakePhotoSettings({}), undefined);
+
+  const cont = extractContinuousConstraints({
+    focusMode: ['manual', 'continuous'],
+    exposureMode: ['continuous'],
+    whiteBalanceMode: ['auto'],
+  });
+  assert.deepEqual(cont.combined, {
+    focusMode: 'continuous',
+    exposureMode: 'continuous',
+  });
+  assert.equal(cont.individual.length, 2);
+
+  assert.equal(CAMERA_ZOOM_FOCUS_SETTLE_MS, 300);
+  assert.equal(computeFocusSettleWaitMs(1000, 1120), 180);
+  assert.equal(computeFocusSettleWaitMs(1000, 1350), 0);
+  assert.equal(computeFocusSettleWaitMs(0, 1120), 0);
+
+  assert.equal(isCameraPermissionDeniedError({ name: 'NotAllowedError' }), true);
+  assert.equal(isCameraPermissionDeniedError({ name: 'NotReadableError' }), false);
+  assert.equal(isCameraBusyOrOverconstrainedError({ name: 'NotReadableError' }), true);
+  assert.equal(isCameraBusyOrOverconstrainedError({ name: 'OverconstrainedError' }), true);
+
+  // Late-resolving stream after timeout must automatically stop its tracks
+  let lateStopped = false;
+  const lateStream = {
+    getTracks: () => [
+      {
+        stop: () => {
+          lateStopped = true;
+        },
+      },
+    ],
+  } as unknown as MediaStream;
+
+  await assert.rejects(
+    acquireStreamWithTimeout(
+      () =>
+        new Promise<MediaStream>((resolve) => {
+          setTimeout(() => resolve(lateStream), 30);
+        }),
+      { video: true },
+      5
+    ),
+    (err) => isCameraStartTimeoutError(err)
+  );
+  await new Promise((r) => setTimeout(r, 45));
+  assert.equal(lateStopped, true);
+
+  // Retry ladder recovers on 3rd attempt using 500ms, 1000ms waits
+  const mockStream = {
+    getTracks: () => [{ stop: () => {} }],
+  } as unknown as MediaStream;
+  const retryWaits: number[] = [];
+  let attemptCount = 0;
+  const stream = await startCameraWithRetryLadder({
+    getUserMedia: async () => {
+      attemptCount++;
+      if (attemptCount === 1) throw { name: 'OverconstrainedError' };
+      if (attemptCount === 2) throw { name: 'NotReadableError' };
+      return mockStream;
+    },
+    sleep: async (ms) => {
+      retryWaits.push(ms);
+    },
+  });
+  assert.equal(stream, mockStream);
+  assert.equal(attemptCount, 3);
+  assert.deepEqual(retryWaits, [500, 1000]);
+});
+
+test('cameraConstraints builds single combined advanced payload and preserves torch across zoom/focus updates', async () => {
+  const fullCaps = {
+    torch: true,
+    zoom: { min: 1, max: 4, step: 0.1 },
+    focusMode: ['manual', 'continuous'],
+    exposureMode: ['continuous'],
+    whiteBalanceMode: ['auto'], // continuous not supported here
+  };
+
+  const state = createDefaultCameraConstraintState();
+  state.torch = true;
+  state.zoom = 2.5;
+
+  const built = buildUnifiedAdvancedConstraints(state, fullCaps);
+  assert.deepEqual(built, {
+    advanced: [
+      {
+        torch: true,
+        zoom: 2.5,
+        focusMode: 'continuous',
+        exposureMode: 'continuous',
+      },
+    ],
+  });
+
+  // Unsupported capabilities -> returns null without crashing
+  assert.equal(buildUnifiedAdvancedConstraints(state, { whiteBalanceMode: ['manual'] }), null);
+
+  // Mock track verifying single applyConstraints call preserves all fields & reads back settings
+  const sentConstraints: MediaTrackConstraints[] = [];
+  let currentSettings: Record<string, unknown> = {
+    torch: false,
+    zoom: 1,
+    focusMode: 'continuous',
+    exposureMode: 'continuous',
+  };
+  const fakeTrack = {
+    readyState: 'live' as const,
+    getCapabilities: () => fullCaps,
+    getSettings: () => ({ ...currentSettings }),
+    applyConstraints: async (c?: MediaTrackConstraints) => {
+      if (c) sentConstraints.push(c);
+      const adv = (c?.advanced?.[0] ?? {}) as Record<string, unknown>;
+      currentSettings = { ...adv };
+    },
+  };
+
+  const resOn = await applyUnifiedTrackConstraints(fakeTrack, state);
+  assert.equal(sentConstraints.length, 1);
+  assert.equal(resOn.applied, true);
+  assert.equal(resOn.torchSupported, true);
+  assert.equal(resOn.requestedTorch, true);
+  assert.equal(resOn.actualTorch, true);
+  assert.equal(resOn.errorMessage, null);
+
+  // Changing zoom must still include torch: true in that single call
+  state.zoom = 3;
+  const resZoom = await applyUnifiedTrackConstraints(fakeTrack, state);
+  assert.equal(sentConstraints.length, 2);
+  assert.equal(resZoom.actualTorch, true);
+  assert.deepEqual(sentConstraints[1], {
+    advanced: [
+      {
+        torch: true,
+        zoom: 3,
+        focusMode: 'continuous',
+        exposureMode: 'continuous',
+      },
+    ],
+  });
+
+  // Rejected applyConstraints surfaces clean errorMessage and reports real getSettings().torch
+  const rejectingTrack = {
+    readyState: 'live' as const,
+    getCapabilities: () => fullCaps,
+    getSettings: () => ({ torch: false, zoom: 1 }),
+    applyConstraints: async () => {
+      const err = new Error('Torch rejected by driver');
+      err.name = 'OverconstrainedError';
+      throw err;
+    },
+  };
+  const resErr = await applyUnifiedTrackConstraints(rejectingTrack, state);
+  assert.equal(resErr.applied, false);
+  assert.equal(resErr.requestedTorch, true);
+  assert.equal(resErr.actualTorch, false);
+  assert.ok(resErr.errorMessage?.includes('Torch rejected'));
+});
+
+test('cameraDiagnostics formats preview, saved photo, takePhoto, torch states, error, constraints, and clipboard text cleanly', () => {
+  const info = {
+    previewWidth: 1920,
+    previewHeight: 1080,
+    frameRate: 30,
+    takePhotoSupported: true,
+    maxPhotoWidth: 4032,
+    maxPhotoHeight: 3024,
+    focusMode: 'continuous',
+    exposureMode: 'continuous',
+    lastSavedPhotoWidth: 4032,
+    lastSavedPhotoHeight: 3024,
+    lastSavedPhotoMethod: 'takePhoto' as const,
+    torchSupported: true,
+    requestedTorch: true,
+    actualTorch: false,
+    lastApplyConstraintsError: 'OverconstrainedError: busy',
+    lastAppliedConstraints: {
+      advanced: [{ torch: true, zoom: 2, focusMode: 'continuous' }],
+    },
+  };
+  const rows = buildCameraDiagnosticsRows(info);
+  assert.equal(rows.length, 9);
+  assert.ok(rows[0].value.includes('1920 × 1080'));
+  assert.ok(rows[1].value.includes('4032 × 3024'));
+  assert.ok(rows[2].value.includes('مدعوم'));
+  assert.ok(rows[3].value.includes('continuous'));
+  assert.equal(rows[4].value, 'نعم');
+  assert.ok(rows[5].value.includes('ON'));
+  assert.ok(rows[6].value.includes('OFF'));
+  assert.ok(rows[7].value.includes('OverconstrainedError: busy'));
+  assert.ok(rows[8].value.includes('"torch":true'));
+
+  const text = formatCameraDiagnosticsClipboardText(info);
+  assert.ok(text.includes('معلومات الكاميرا:'));
+  assert.ok(text.includes('4032 × 3024'));
+  assert.ok(text.includes('دعم الفلاش'));
+  assert.ok(text.includes('OverconstrainedError: busy'));
+});
+
+test('cameraSelection prefers main back camera, caps candidates at 4, picks torch winner, and detects empty labels', () => {
+  assert.equal(
+    areVideoDeviceLabelsEmpty([
+      { kind: 'videoinput', deviceId: '1', label: '' },
+      { kind: 'videoinput', deviceId: '2', label: '   ' },
+    ]),
+    true
+  );
+  assert.equal(
+    areVideoDeviceLabelsEmpty([
+      { kind: 'videoinput', deviceId: '1', label: '' },
+      { kind: 'videoinput', deviceId: '2', label: 'camera2 0, facing back' },
+    ]),
+    false
+  );
+
+  const devices = [
+    { kind: 'videoinput', deviceId: 'front-1', label: 'camera2 1, facing front' },
+    { kind: 'videoinput', deviceId: 'back-wide', label: 'camera2 2, facing back ultra wide' },
+    { kind: 'videoinput', deviceId: 'back-macro', label: 'camera2 3, facing back macro' },
+    { kind: 'videoinput', deviceId: 'back-main', label: 'camera2 0, facing back' },
+    { kind: 'videoinput', deviceId: 'back-tele', label: 'camera2 4, facing back tele' },
+    { kind: 'videoinput', deviceId: 'back-depth', label: 'camera2 5, facing back depth' },
+  ];
+
+  const selected = selectBackCameraCandidates(devices, 4);
+  assert.equal(selected.length, 4);
+  assert.equal(selected[0].deviceId, 'back-main');
+  assert.equal(selected[0].isPreferredMainBack, true);
+  assert.equal(selected.some((c) => c.deviceId === 'front-1'), false);
+
+  const probed = [
+    { ...selected[0], torchSupported: false, probed: true },
+    { ...selected[1], torchSupported: true, probed: true },
+    { ...selected[2], torchSupported: true, probed: true },
+    { ...selected[3], torchSupported: false, probed: true },
+  ];
+  assert.equal(pickBestTorchCandidate(probed)?.deviceId, selected[1].deviceId);
+
+  // If main back supports torch, it always wins even if another lens also supports torch
+  const mainTorch = [
+    { ...selected[1], torchSupported: true, probed: true },
+    { ...selected[0], torchSupported: true, probed: true },
+  ];
+  assert.equal(pickBestTorchCandidate(mainTorch)?.deviceId, 'back-main');
+  assert.equal(
+    pickBestTorchCandidate([
+      { ...selected[0], torchSupported: false, probed: true },
+    ]),
+    null
+  );
+
+  assert.deepEqual(
+    extractZoomRangeFromCapabilities({ zoom: { min: 1, max: 8, step: 0.1 } }),
+    { min: 1, max: 8, step: 0.1 }
+  );
+  assert.equal(extractZoomRangeFromCapabilities({ zoom: { min: 1, max: 1 } }), undefined);
+});
+
+test('cameraStartup locks targetDeviceId across all retries and formatConstraintsError preserves exact error details', () => {
+  const lockedAttempts = buildCameraConstraintAttempts(true, 'back-main-id');
+  assert.equal(lockedAttempts.length, 4);
+  for (const attempt of lockedAttempts) {
+    const video = attempt.video as MediaTrackConstraints;
+    assert.deepEqual(video.deviceId, { exact: 'back-main-id' });
+    assert.equal('facingMode' in video, false);
+  }
+  assert.deepEqual(
+    (lockedAttempts[0].video as MediaTrackConstraints).width,
+    { ideal: 1920 }
+  );
+  assert.deepEqual(lockedAttempts[3], {
+    audio: false,
+    video: { deviceId: { exact: 'back-main-id' } },
+  });
+
+  const overErr = {
+    name: 'OverconstrainedError',
+    constraint: 'torch',
+    message: 'Torch not supported on this lens',
+  };
+  assert.equal(
+    formatConstraintsError(overErr),
+    'OverconstrainedError (torch): Torch not supported on this lens'
+  );
+  const notSupErr = new Error('Flash hardware busy');
+  notSupErr.name = 'NotSupportedError';
+  assert.equal(
+    formatConstraintsError(notSupErr),
+    'NotSupportedError: Flash hardware busy'
+  );
+});
+
+test('cameraDiagnostics lists candidate cameras with torch/zoom/active marker in rows and clipboard text', () => {
+  const info = {
+    torchSupported: true,
+    activeCameraDeviceId: 'cam-main',
+    candidates: [
+      {
+        deviceId: 'cam-main',
+        label: 'camera2 0, facing back',
+        index: 0,
+        isPreferredMainBack: true,
+        torchSupported: true,
+        zoomMin: 1,
+        zoomMax: 8,
+        zoomStep: 0.1,
+        probed: true,
+      },
+      {
+        deviceId: 'cam-wide',
+        label: 'camera2 2, facing back wide',
+        index: 1,
+        isPreferredMainBack: false,
+        torchSupported: false,
+        zoomMin: 0.6,
+        zoomMax: 1,
+        zoomStep: 0.1,
+        probed: true,
+        probeError: 'NotSupportedError: no torch',
+      },
+    ],
+  };
+
+  const rows = buildCameraDiagnosticsRows(info);
+  assert.equal(rows.length, 11);
+  assert.equal(rows[9].label, 'كاميرا 1 (المستخدمة)');
+  assert.ok(rows[9].value.includes('camera2 0, facing back'));
+  assert.ok(rows[9].value.includes('فلاش: نعم'));
+  assert.ok(rows[9].value.includes('تقريب: 1–8x'));
+  assert.equal(rows[10].label, 'كاميرا 2');
+  assert.ok(rows[10].value.includes('فلاش: لا'));
+  assert.ok(rows[10].value.includes('NotSupportedError: no torch'));
+
+  const clipboard = formatCameraDiagnosticsClipboardText(info);
+  assert.ok(clipboard.includes('كاميرا 1 (المستخدمة)'));
+  assert.ok(clipboard.includes('فلاش: نعم'));
+  assert.ok(clipboard.includes('فلاش: لا'));
+});
+
+test('musicLogic handles filenames, time formatting, storage limits, and low-storage checks', () => {
+  assert.equal(stripAudioFileExtension('track-01.mp3'), 'track-01');
+  assert.equal(stripAudioFileExtension('أنشودة. الصباح.wav'), 'أنشودة. الصباح');
+  assert.equal(formatAudioTime(0), '00:00');
+  assert.equal(formatAudioTime(75), '01:15');
+  assert.equal(formatAudioTime(3661), '1:01:01');
+  assert.equal(formatAudioTime(Number.NaN), '00:00');
+
+  assert.equal(DEFAULT_MUSIC_MAX_STORAGE_MB, 500);
+  const underCap = canAddAudioBytes(100 * 1024 * 1024, 50 * 1024 * 1024, 500);
+  assert.equal(underCap.ok, true);
+  const overCap = canAddAudioBytes(490 * 1024 * 1024, 20 * 1024 * 1024, 500);
+  assert.equal(overCap.ok, false);
+
+  assert.equal(isBrowserStorageLow(900, 1000), true);
+  assert.equal(isBrowserStorageLow(100 * 1024 * 1024, 1000 * 1024 * 1024), false);
+  assert.equal(isValidRadioUrl('https://stream.example.com/live.mp3'), true);
+  assert.equal(isValidRadioUrl('http://radio.local:8000/stream'), true);
+  assert.equal(isValidRadioUrl('ftp://invalid.com/a.mp3'), false);
+  assert.equal(isValidRadioUrl('not-a-url'), false);
+});
+
+test('musicLogic handles playlist navigation, repeat, shuffle, failed-track loop prevention, reorder & search', () => {
+  const makeTrack = (
+    id: string,
+    title: string,
+    order: number,
+    overrides: Partial<MusicTrackRecord> = {}
+  ): MusicTrackRecord => ({
+    id,
+    kind: 'file',
+    title,
+    duration: 120,
+    size: 1024,
+    order,
+    createdAt: 1000 + order,
+    updatedAt: 1000 + order,
+    ...overrides,
+  });
+
+  const tracks: MusicTrackRecord[] = [
+    makeTrack('t1', 'مقطع أول', 0),
+    makeTrack('t2', 'مفقود', 1, { missingFile: true }),
+    makeTrack('t3', 'إذاعة مباشرة', 2, {
+      kind: 'radio',
+      streamUrl: 'https://radio.example/stream',
+    }),
+    makeTrack('t4', 'مقطع رابع', 3),
+  ];
+
+  // Skips missingFile track (index 1) cleanly
+  assert.equal(pickNextTrackIndex(tracks, 0, false, 'off', 'next'), 2);
+  // Stops at end when repeat === 'off'
+  assert.equal(pickNextTrackIndex(tracks, 3, false, 'off', 'next'), -1);
+  // Wraps around when repeat === 'all'
+  assert.equal(pickNextTrackIndex(tracks, 3, false, 'all', 'next'), 0);
+  // Stays on same track when repeat === 'one'
+  assert.equal(pickNextTrackIndex(tracks, 2, false, 'one', 'next'), 2);
+  // Shuffle avoids repeating current index when other tracks exist
+  assert.notEqual(pickNextTrackIndex(tracks, 0, true, 'all', 'next', undefined, () => 0.1), 0);
+  // Prevents infinite loop when all playable tracks failed
+  const allFailed = new Set(['t1', 't3', 't4']);
+  assert.equal(pickNextTrackIndex(tracks, 0, false, 'all', 'next', allFailed), -1);
+
+  // Reorder up / down
+  const movedUp = reorderTrackList(tracks, 't3', 'up');
+  assert.deepEqual(
+    movedUp.map((t) => t.id),
+    ['t1', 't3', 't2', 't4']
+  );
+  // Search filter
+  assert.equal(filterPlaylistTracks(tracks, 'إذاعة').length, 1);
+  assert.equal(filterPlaylistTracks(tracks, 'رابع')[0]?.id, 't4');
+});
+
+test('musicLogic builds backup without blobs and flags missing files upon restore', () => {
+  const original: MusicTrackRecord[] = [
+    {
+      id: 'f1',
+      kind: 'file',
+      title: 'ملف محلي',
+      fileName: 'local-song.mp3',
+      duration: 180,
+      size: 500000,
+      order: 0,
+      createdAt: 100,
+      updatedAt: 100,
+    },
+    {
+      id: 'r1',
+      kind: 'radio',
+      title: 'راديو الصباح',
+      streamUrl: 'https://example.com/live',
+      duration: 0,
+      size: 0,
+      order: 1,
+      createdAt: 200,
+      updatedAt: 200,
+    },
+  ];
+
+  const backup = buildMusicBackupTracks(original);
+  assert.equal(backup.length, 2);
+  assert.equal('blob' in (backup[0] as unknown as Record<string, unknown>), false);
+
+  // Restore on a clean device with zero local blobs
+  const restored = mergeImportedMusicTracks([], new Set(), backup);
+  assert.equal(restored.length, 2);
+  assert.equal(restored[0].missingFile, true);
+  assert.equal(restored[1].missingFile, false);
+  assert.equal(restored[1].streamUrl, 'https://example.com/live');
+  assert.equal(MISSING_FILE_LABEL, 'الملف غير موجود، أعد إضافته');
+
+  // Re-adding a file matching filename matches missing track automatically
+  const matched = findMatchingMissingTrack(restored, 'local-song.mp3', 500000);
+  assert.equal(matched?.id, 'f1');
+});
+
+test('musicPlaybackFlag tracks active playback state synchronously for shutter mute', () => {
+  setMusicPlayingActive(false);
+  assert.equal(isMusicPlayingActive(), false);
+  setMusicPlayingActive(true);
+  assert.equal(isMusicPlayingActive(), true);
+  setMusicPlayingActive(false);
+  assert.equal(isMusicPlayingActive(), false);
+});
+
+test('musicLogic computes sleep timer remaining seconds, badge formatting, and floating button bounds', () => {
+  assert.deepEqual([...SLEEP_TIMER_PRESETS_MIN], [15, 30, 60]);
+  assert.equal(computeSleepTimerRemainingSec(null, 1000), 0);
+  assert.equal(computeSleepTimerRemainingSec(10000, 10000), 0);
+  assert.equal(computeSleepTimerRemainingSec(10000, 12000), 0);
+  assert.equal(computeSleepTimerRemainingSec(100000, 10000), 90);
+  assert.equal(formatSleepTimerBadge(0), '');
+  assert.equal(formatSleepTimerBadge(90), '01:30');
+  assert.equal(formatSleepTimerBadge(900), '15:00');
+
+  assert.equal(clampFloatingButtonY(-50, 844), 56);
+  assert.equal(clampFloatingButtonY(9999, 844), 844 - 44 - 92);
+  assert.equal(clampFloatingButtonY(320, 844), 320);
+  assert.equal(getDefaultFloatingButtonY(844, 44), 400);
+});
+
+test('musicLogic handles FAB color presets, idle timing, supported audio extensions, duplicates by (name+size), and import summary', () => {
+  assert.equal(MUSIC_IDLE_FADE_DELAY_MS, 4000);
+  assert.equal(MUSIC_IDLE_OPACITY, 0.35);
+  assert.equal(MUSIC_FAB_COLOR_PRESETS.length, 6);
+  assert.equal(resolveMusicFabColorPreset(undefined).id, 'violet-pink');
+  assert.equal(resolveMusicFabColorPreset('unknown').id, 'violet-pink');
+  assert.equal(resolveMusicFabColorPreset('indigo-cyan').id, 'indigo-cyan');
+
+  // Audio filter accepts MIME audio/* and listed extensions case-insensitively, rejects images/0-byte
+  assert.equal(isSupportedAudioFile({ name: 'song.MP3', type: '', size: 100 }), true);
+  assert.equal(isSupportedAudioFile({ name: 'voice.M4A', type: '', size: 100 }), true);
+  assert.equal(isSupportedAudioFile({ name: 'clip.opus', type: '', size: 100 }), true);
+  assert.equal(isSupportedAudioFile({ name: 'track.flac', type: '', size: 100 }), true);
+  assert.equal(isSupportedAudioFile({ name: 'custom.bin', type: 'audio/ogg', size: 100 }), true);
+  assert.equal(isSupportedAudioFile({ name: 'cover.jpg', type: 'image/jpeg', size: 100 }), false);
+  assert.equal(isSupportedAudioFile({ name: 'empty.mp3', type: 'audio/mp3', size: 0 }), false);
+
+  // Duplicate detection checks (fileName + size) ignoring missing placeholders
+  const existing: MusicTrackRecord[] = [
+    {
+      id: 't1',
+      kind: 'file',
+      title: 'أول',
+      fileName: 'Song.mp3',
+      duration: 60,
+      size: 2048,
+      order: 0,
+      missingFile: false,
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    {
+      id: 't2',
+      kind: 'file',
+      title: 'مفقود',
+      fileName: 'Lost.mp3',
+      duration: 60,
+      size: 4096,
+      order: 1,
+      missingFile: true,
+      createdAt: 2,
+      updatedAt: 2,
+    },
+  ];
+  const seen = new Set<string>([makeAudioDuplicateKey('Batch.wav', 1024)]);
+  assert.equal(isDuplicateAudioFile(existing, seen, 'song.mp3', 2048), true);
+  assert.equal(isDuplicateAudioFile(existing, seen, 'song.mp3', 2049), false);
+  assert.equal(isDuplicateAudioFile(existing, seen, 'batch.wav', 1024), true);
+  assert.equal(isDuplicateAudioFile(existing, seen, 'Lost.mp3', 4096), false);
+
+  assert.equal(
+    formatMusicImportSummary({ addedCount: 5, skippedDuplicatesCount: 2, failedCount: 1 }),
+    'أضيف 5 ملف · تم تخطي 2 مكرر · فشل 1'
+  );
+});
+
+test('quantityLogic extracts standalone trailing numbers accurately while protecting weights, units, and calculator lines', () => {
+  // Valid standalone trailing quantities (English, Arabic-Indic, decimals)
+  assert.deepEqual(extractTrailingQuantity('حليب 5'), {
+    cleanName: 'حليب',
+    quantity: 5,
+  });
+  assert.deepEqual(extractTrailingQuantity('عصير برتقال ١٢'), {
+    cleanName: 'عصير برتقال',
+    quantity: 12,
+  });
+  assert.deepEqual(extractTrailingQuantity('زيت زيتون 1.5'), {
+    cleanName: 'زيت زيتون',
+    quantity: 1.5,
+  });
+
+  // Weight + final standalone quantity -> keeps weight, extracts final number
+  assert.deepEqual(extractTrailingQuantity('قوطية 200غ 5'), {
+    cleanName: 'قوطية 200غ',
+    quantity: 5,
+  });
+  assert.deepEqual(extractTrailingQuantity('شامبو 400 مل 3'), {
+    cleanName: 'شامبو 400 مل',
+    quantity: 3,
+  });
+
+  // Weights/units attached or trailing -> NEVER extracted
+  assert.equal(extractTrailingQuantity('جبن 200غ'), null);
+  assert.equal(extractTrailingQuantity('عسل 850 غ'), null);
+  assert.equal(extractTrailingQuantity('ماء 1.5 لتر'), null);
+  assert.equal(extractTrailingQuantity('عصير ٣٥٠ مل'), null);
+  assert.equal(extractTrailingQuantity('شاي 12 pcs'), null);
+  assert.equal(extractTrailingQuantity('علب 500gm'), null);
+
+  // Calculator lines / pure digits / math expressions -> NEVER extracted
+  assert.equal(extractTrailingQuantity('42'), null);
+  assert.equal(extractTrailingQuantity('6 * 12'), null);
+  assert.equal(extractTrailingQuantity('حليب 6 * 12'), null);
+  assert.equal(extractTrailingQuantity('شاي 2 + 3'), null);
+  assert.equal(extractTrailingQuantity('2026-11-19'), null);
+});
+
+test('quantityLogic converts existing note lines, realigns on line edits, summarizes totals, and computes toolbar overflow count', () => {
+  const existingBody = 'حليب 5\nجبن 200غ\nقوطية 200غ 3\n6 * 12\nخبز';
+  assert.equal(countConvertibleTrailingLines(existingBody.split('\n')), 2);
+
+  const converted = convertExistingNoteLinesToQuantities(existingBody, []);
+  assert.equal(converted.convertedCount, 2);
+  assert.equal(converted.body, 'حليب\nجبن 200غ\nقوطية 200غ\n6 * 12\nخبز');
+  assert.deepEqual(converted.lineQuantities, [
+    { lineIndex: 0, quantity: 5 },
+    { lineIndex: 2, quantity: 3 },
+  ]);
+
+  const summary = computeNoteQuantitiesSummary(
+    converted.body.split('\n'),
+    converted.lineQuantities
+  );
+  assert.equal(summary.itemCount, 4); // 4 letter lines (calculator line '6 * 12' excluded)
+  assert.equal(summary.quantifiedCount, 2);
+  assert.equal(summary.totalQuantity, 8);
+
+  // Insert a blank line after line 0 -> quantity and unit at index 2 shift to index 3
+  const shifted = realignLineQuantitiesAfterEdit(
+    ['حليب', 'جبن 200غ', 'قوطية 200غ'],
+    ['حليب', '', 'جبن 200غ', 'قوطية 200غ'],
+    [
+      { lineIndex: 0, quantity: 5, unit: 'carton' },
+      { lineIndex: 2, quantity: 3, unit: 'piece' },
+    ]
+  );
+  assert.deepEqual(shifted, [
+    { lineIndex: 0, quantity: 5, unit: 'carton' },
+    { lineIndex: 3, quantity: 3, unit: 'piece' },
+  ]);
+
+  // Toolbar overflow calculation reserves 1 slot for "⋯" and prevents wrapping on narrow screens
+  assert.equal(computeToolbarVisibleCount(600, 6, 62, 4), 6);
+  assert.equal(computeToolbarVisibleCount(300, 6, 62, 4), 3); // 3 primary + ⋯ = 4 slots on narrow screen
+});
+
+test('noteFormat formats notes with BiDi quantity marks, units (كارتون/قطع), alphabetical sort, Arabic digits, and excludes date/item count on copy', () => {
+  const body = 'كعك\nحليب\n\nماء';
+  const quantities = [
+    { lineIndex: 0, quantity: 2 },
+    { lineIndex: 1, quantity: 5 },
+  ];
+
+  // Legacy OFF mode stays 100% identical (no parens, keeps blank line)
+  assert.equal(
+    formatNoteForCopy({
+      title: 'مقاضي',
+      body,
+      numberingEnabled: true,
+      quantitiesEnabled: false,
+      lineQuantities: quantities,
+    }),
+    'مقاضي\n1. كعك\n2. حليب\n\n4. ماء'
+  );
+
+  // ON + units (كارتون / قطع) + as-written + western digits + numbered
+  assert.equal(
+    formatNoteForCopy({
+      title: 'مقاضي',
+      body,
+      numberingEnabled: true,
+      quantitiesEnabled: true,
+      lineQuantities: [
+        { lineIndex: 0, quantity: 2, unit: 'carton' },
+        { lineIndex: 1, quantity: 5, unit: 'piece' },
+      ],
+      sortOrder: 'as-written',
+      digitStyle: 'western',
+      includeTotalQuantities: false,
+    }),
+    'مقاضي\n1. كعك \u200F(\u200E\u200E2\u200E كارتون\u200E)\u200F\n2. حليب \u200F(\u200E\u200E5\u200E قطع\u200E)\u200F\n3. ماء'
+  );
+
+  // ON + alphabetical + arabic digits + unnumbered
+  assert.equal(
+    formatNoteForCopy({
+      title: '',
+      body: 'موز\nبرتقال\nتفاح',
+      numberingEnabled: false,
+      quantitiesEnabled: true,
+      lineQuantities: [
+        { lineIndex: 0, quantity: 3 },
+        { lineIndex: 2, quantity: 12 },
+      ],
+      sortOrder: 'alphabetical',
+      digitStyle: 'arabic',
+      includeTotalQuantities: true,
+    }),
+    'برتقال\nتفاح \u200F(\u200E١٢\u200E)\u200F\nموز \u200F(\u200E٣\u200E)\u200F\nالمجموع: ١٥'
+  );
+
+  // WhatsApp with quantities + optional total
+  const waText = formatNoteForWhatsApp({
+    title: 'طلب',
+    body: 'حليب\nعصير',
+    numberingEnabled: true,
+    quantitiesEnabled: true,
+    lineQuantities: [{ lineIndex: 0, quantity: 4, unit: 'carton' }],
+    digitStyle: 'western',
+    includeTotalQuantities: true,
+  });
+  assert.equal(
+    waText,
+    'طلب\n1. حليب \u200F(\u200E\u200E4\u200E كارتون\u200E)\u200F\n2. عصير\nالمجموع: 4'
+  );
+
+  // formatNoteWithDetails must NOT write today's date or total item count ("عدد المواد")
+  const details = formatNoteWithDetails({
+    title: 'طلب',
+    body: 'حليب\nعصير',
+    dateLabel: 'اليوم',
+    numberingEnabled: true,
+    quantitiesEnabled: true,
+    lineQuantities: [{ lineIndex: 0, quantity: 4, unit: 'piece' }],
+  });
+  assert.equal(details.includes('التاريخ:'), false);
+  assert.equal(details.includes('عدد المواد:'), false);
+  assert.equal(details.includes('اليوم'), false);
+  assert.ok(details.includes('1. حليب'));
+  assert.ok(details.includes('قطع'));
+});
+
+test('duplicateDetector ignores trailing quantities when enabled and merges duplicate lines by adding box quantities and preserving unit', () => {
+  // With ignoreTrailingQuantity: true, "حليب 3" matches "حليب 5" and "حليب"
+  assert.deepEqual(
+    normalizeNoteLineWords('حليب 3', { ignoreTrailingQuantity: true }),
+    ['حليب']
+  );
+  // Weights stay part of identity even when ignoreTrailingQuantity is true
+  assert.deepEqual(
+    normalizeNoteLineWords('جبن 200غ', { ignoreTrailingQuantity: true }),
+    ['جبن', '200غ']
+  );
+
+  const dup = findDuplicateForFinishedLine({
+    lines: ['حليب 3', 'عصير', 'حليب 7'],
+    finishedLineIndex: 2,
+    ignoreTrailingQuantity: true,
+  });
+  assert.ok(dup);
+  assert.equal(dup?.matchLineIndex, 0);
+
+  // Merging two duplicate lines adds their box quantities (3 + 4 = 7) and aligns remaining lines
+  const merged = mergeDuplicateLines({
+    body: 'حليب\nخبز\nحليب\nعصير',
+    linePhotos: [{ lineIndex: 2, dataUrl: 'pic_milk' }, { lineIndex: 3, dataUrl: 'pic_juice' }],
+    lineQuantities: [
+      { lineIndex: 0, quantity: 3, unit: 'carton' },
+      { lineIndex: 2, quantity: 4 },
+      { lineIndex: 3, quantity: 2, unit: 'piece' },
+    ],
+    keepIndex: 0,
+    removeIndices: [2],
+  });
+  assert.equal(merged.body, 'حليب\nخبز\nعصير');
+  assert.equal(merged.mergedQuantity, 7);
+  assert.deepEqual(merged.lineQuantities, [
+    { lineIndex: 0, quantity: 7, unit: 'carton' },
+    { lineIndex: 2, quantity: 2, unit: 'piece' },
+  ]);
+  assert.deepEqual(merged.linePhotos, [
+    { lineIndex: 0, dataUrl: 'pic_milk' },
+    { lineIndex: 2, dataUrl: 'pic_juice' },
+  ]);
+});
+
+test('backupSanitizer strips legacy AI fields and ignores AI sections when importing legacy backups', () => {
+  const rawLegacyPhoto = {
+    id: 'ph_1',
+    sessionId: 'sess_1',
+    timestamp: 1700000000000,
+    dateKey: '2026-11-20',
+    dataUrl: 'data:image/jpeg;base64,AQID',
+    width: 1080,
+    height: 1920,
+    done: true,
+    shelfId: 'shelf_1',
+    shelfLabel: 'ممر 2',
+    status: 'done',
+    photoQuality: 'good',
+    errorMessage: 'old err',
+    analyzedAt: 1700000005000,
+  };
+  assert.equal(hasLegacyPhotoAiFields(rawLegacyPhoto), true);
+
+  const cleanPhoto = sanitizePhotoRecord(rawLegacyPhoto);
+  assert.ok(cleanPhoto);
+  assert.equal(cleanPhoto.id, 'ph_1');
+  assert.equal(cleanPhoto.done, true);
+  assert.equal(cleanPhoto.dataUrl, 'data:image/jpeg;base64,AQID');
+  assert.equal(hasLegacyPhotoAiFields(cleanPhoto), false);
+  assert.equal('shelfId' in cleanPhoto, false);
+  assert.equal('status' in cleanPhoto, false);
+  assert.equal('analyzedAt' in cleanPhoto, false);
+
+  const rawLegacySettings = {
+    cameraHighQuality: false,
+    defaultNoteQuantities: true,
+    aiAnalysisEnabled: true,
+    activeShelfLabel: 'ممر الشامبو',
+    unifiedFraming: true,
+  };
+  assert.equal(hasLegacySettingsAiFields(rawLegacySettings), true);
+  const cleanSettings = sanitizeSettingsRecord(rawLegacySettings);
+  assert.equal(cleanSettings.cameraHighQuality, false);
+  assert.equal(cleanSettings.defaultNoteQuantities, true);
+  assert.equal(hasLegacySettingsAiFields(cleanSettings), false);
+  assert.equal('aiAnalysisEnabled' in cleanSettings, false);
+  assert.equal('activeShelfLabel' in cleanSettings, false);
+
+  const legacyBackupJson = JSON.stringify({
+    app: 'naqs-shelf-app',
+    version: 14,
+    exportedAt: '2026-11-20T10:00:00.000Z',
+    settings: rawLegacySettings,
+    photos: [rawLegacyPhoto],
+    notes: [
+      {
+        id: 'n_1',
+        title: 'ملاحظة محفوظة',
+        body: 'حليب',
+        photos: [],
+        numberingEnabled: true,
+        resetAfterBlankLine: false,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ],
+    whatsappRecipients: [
+      { id: 'w1', name: 'أحمد', phone: '9647701234567', createdAt: 1, updatedAt: 1 },
+    ],
+    shortages: [{ id: 's1', productName: 'نقص قديم' }],
+    products: [{ id: 'pr1', name: 'منتج قديم' }],
+    shelves: [{ id: 'sh1', name: 'رف قديم' }],
+    manualMarks: [{ id: 'm1' }],
+    pullHistory: [{ id: 'pu1' }],
+    aiModule: {
+      ai_photos: [{ id: 'ap1' }],
+      ai_gaps: [{ id: 'ag1' }],
+      ai_products: [{ id: 'apr1' }],
+    },
+    musicModule: {
+      tracks: [
+        {
+          id: 't1',
+          title: 'مقطع صوتي',
+          fileName: 'track.mp3',
+          mimeType: 'audio/mpeg',
+          sizeBytes: 1024,
+          durationSec: 60,
+          createdAt: 1,
+          orderIndex: 0,
+        },
+      ],
+    },
+  });
+
+  const imported = normalizeImportedBackup(legacyBackupJson);
+  assert.equal(imported.photos.length, 1);
+  assert.equal(hasLegacyPhotoAiFields(imported.photos[0]), false);
+  assert.equal(imported.notes.length, 1);
+  assert.equal(imported.notes[0].title, 'ملاحظة محفوظة');
+  assert.equal(imported.whatsappRecipients?.length, 1);
+  assert.equal(imported.musicModule?.tracks.length, 1);
+  assert.ok(imported.settings);
+  assert.equal(hasLegacySettingsAiFields(imported.settings), false);
+  assert.equal('aiModule' in imported, false);
+  assert.equal('shortages' in imported, false);
+  assert.equal('products' in imported, false);
+
+  // One-time cleanup flag helper
+  const mem = new Map<string, string>();
+  const mockStorage = {
+    getItem: (k: string) => mem.get(k) ?? null,
+    setItem: (k: string, v: string) => {
+      mem.set(k, v);
+    },
+  };
+  assert.equal(isLegacyAiCleanupDone(mockStorage), false);
+  markLegacyAiCleanupDone(mockStorage);
+  assert.equal(mem.get(LEGACY_AI_CLEANUP_STORAGE_KEY), '1');
+  assert.equal(isLegacyAiCleanupDone(mockStorage), true);
+});
+
+test('coverArt extracts ID3 APIC and MP4 covr embedded art, computes 8-color deterministic tiles and initials', () => {
+  assert.equal(TRACK_TILE_COLORS.length, 8);
+  assert.equal(hashTitleToColorIndex('أنشودة الصباح'), hashTitleToColorIndex('أنشودة الصباح'));
+  assert.equal(resolveTrackTileColor('أنشودة', 'crimson').id, 'crimson');
+  assert.equal(getTrackInitialLetter('أغنية جديدة'), 'أ');
+  assert.equal(getTrackInitialLetter('01_صباح_الخير'), 'ص');
+  assert.equal(getTrackInitialLetter('2026'), '2');
+  assert.equal(getTrackInitialLetter('  track 01 '), 'T');
+  assert.equal(getTrackInitialLetter('---'), '♪');
+
+  // Construct minimal valid ID3v2.3 tag with APIC frame containing JPEG magic bytes
+  const fakeJpeg = new Uint8Array(24);
+  fakeJpeg.set([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46], 0);
+  const mimeBytes = Array.from('image/jpeg', (c) => c.charCodeAt(0));
+  const apicPayload = new Uint8Array([
+    0x00, // encoding
+    ...mimeBytes,
+    0x00, // null after mime
+    0x03, // front cover type
+    0x00, // empty description null
+    ...fakeJpeg,
+  ]);
+  const frameHeader = new Uint8Array([
+    0x41, 0x50, 0x49, 0x43, // APIC
+    0x00, 0x00, 0x00, apicPayload.length,
+    0x00, 0x00,
+  ]);
+  const totalTagSize = frameHeader.length + apicPayload.length;
+  const id3Tag = new Uint8Array([
+    0x49, 0x44, 0x33, // ID3
+    0x03, 0x00, // v2.3
+    0x00,
+    0x00, 0x00, (totalTagSize >> 7) & 0x7f, totalTagSize & 0x7f,
+    ...frameHeader,
+    ...apicPayload,
+  ]);
+  const extractedId3 = extractEmbeddedCoverArtBytes(id3Tag);
+  assert.ok(extractedId3);
+  assert.equal(extractedId3.mimeType, 'image/jpeg');
+  assert.equal(extractedId3.bytes.length, fakeJpeg.length);
+
+  // Construct minimal MP4 moov -> udta -> meta -> ilst -> covr -> data containing PNG magic bytes
+  const makeAtom = (name: string, body: Uint8Array): Uint8Array => {
+    const out = new Uint8Array(8 + body.length);
+    const len = out.length;
+    out[0] = (len >>> 24) & 0xff;
+    out[1] = (len >>> 16) & 0xff;
+    out[2] = (len >>> 8) & 0xff;
+    out[3] = len & 0xff;
+    for (let i = 0; i < 4; i++) out[4 + i] = name.charCodeAt(i);
+    out.set(body, 8);
+    return out;
+  };
+  const fakePng = new Uint8Array(24);
+  fakePng.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+  const dataPayload = new Uint8Array(8 + fakePng.length);
+  dataPayload[3] = 14; // PNG type indicator
+  dataPayload.set(fakePng, 8);
+  const ilstAtom = makeAtom('ilst', makeAtom('covr', makeAtom('data', dataPayload)));
+  const metaBody = new Uint8Array(4 + ilstAtom.length); // 4-byte FullBox flags
+  metaBody.set(ilstAtom, 4);
+  const moovAtom = makeAtom('moov', makeAtom('udta', makeAtom('meta', metaBody)));
+
+  const extractedMp4 = extractEmbeddedCoverArtBytes(moovAtom);
+  assert.ok(extractedMp4);
+  assert.equal(extractedMp4.mimeType, 'image/png');
+  assert.equal(extractedMp4.bytes.length, fakePng.length);
+});
+
+test('musicPlaybackHelpers resolves MIME types (including mp4/webm), formats MediaErrors, handles volume/mute safety, and formats diagnostics', () => {
+  assert.equal(resolveAudioMimeType('', 'song.mp3'), 'audio/mpeg');
+  assert.equal(resolveAudioMimeType('video/mp4', 'clip.mp4'), 'audio/mp4');
+  assert.equal(resolveAudioMimeType('video/webm', 'clip.webm'), 'audio/webm');
+  assert.equal(resolveAudioMimeType('application/octet-stream', 'voice.m4a'), 'audio/mp4');
+  assert.equal(resolveAudioMimeType('', 'track.opus'), 'audio/opus');
+
+  // Supported file filter also accepts mp4 and webm
+  assert.equal(isSupportedAudioFile({ name: 'audio_clip.mp4', type: 'video/mp4', size: 1024 }), true);
+  assert.equal(isSupportedAudioFile({ name: 'voice.webm', type: 'video/webm', size: 1024 }), true);
+
+  // MediaError code messages & decode/source flag
+  const decodeErr = formatMediaErrorReason({
+    mediaErrorCode: 3,
+    mimeType: 'audio/mp4',
+    sizeBytes: 2048,
+    fileName: 'song.m4a',
+  });
+  assert.equal(decodeErr.isDecodeOrSourceError, true);
+  assert.ok(decodeErr.message.includes('تعذر التشغيل:'));
+  assert.ok(decodeErr.message.includes('audio/mp4'));
+  assert.ok(decodeErr.message.includes('2.0 ك.ب'));
+
+  const abortErr = formatMediaErrorReason({
+    playError: { name: 'AbortError', message: 'aborted' },
+  });
+  assert.equal(abortErr.isAbort, true);
+
+  // One-time launch reset when saved state was muted or 0
+  const launchReset = resolveInitialVolumeReset({
+    volume: 0,
+    muted: true,
+    lastNonZeroVolume: 0.6,
+    alreadyReset: false,
+  });
+  assert.equal(launchReset.didReset, true);
+  assert.equal(launchReset.volume, 1);
+  assert.equal(launchReset.muted, false);
+  assert.equal(launchReset.toastText, 'تم رفع الصوت');
+
+  // Subsequent launches do not re-reset user mute unless pressed Play
+  const secondLaunch = resolveInitialVolumeReset({
+    volume: 0.7,
+    muted: true,
+    lastNonZeroVolume: 0.7,
+    alreadyReset: true,
+  });
+  assert.equal(secondLaunch.didReset, false);
+  assert.equal(secondLaunch.muted, true);
+
+  // Pressing Play while muted restores lastNonZeroVolume (or 80% fallback) and shows toast
+  const playUnmute = resolvePlayVolumeState({
+    volume: 0.65,
+    muted: true,
+    lastNonZeroVolume: 0.65,
+  });
+  assert.equal(playUnmute.didAutoUnmute, true);
+  assert.equal(playUnmute.muted, false);
+  assert.equal(playUnmute.volume, 0.65);
+  assert.equal(playUnmute.toastText, 'كان الصوت مكتوماً — تم تشغيله');
+
+  const playZeroFallback = resolvePlayVolumeState({
+    volume: 0,
+    muted: false,
+    lastNonZeroVolume: 0,
+  });
+  assert.equal(playZeroFallback.didAutoUnmute, true);
+  assert.equal(playZeroFallback.volume, 0.8);
+
+  // Diagnostics clipboard formatting
+  const diagText = formatPlaybackDiagnosticsText({
+    trackTitle: 'اختبار',
+    fileName: 'test_track.mp4',
+    mimeType: 'video/mp4',
+    resolvedMimeType: 'audio/mp4',
+    sizeBytes: 1024 * 1024,
+    durationSec: 125,
+    readyState: 4,
+    networkState: 1,
+    volume: 0.85,
+    muted: false,
+    paused: false,
+    ended: false,
+    lastError: null,
+  });
+  assert.ok(diagText.includes('test_track.mp4'));
+  assert.ok(diagText.includes('audio/mp4'));
+  assert.ok(diagText.includes('85%'));
+  assert.ok(diagText.includes('صوت الوسائط'));
+});
+
+test('musicLogic derives short names cleanly, filters tabs/recent/lists, and preserves metadata without covers/blobs in backup', () => {
+  assert.equal(deriveShortTrackName('01_صباح__الخير.mp3'), '01 صباح الخير');
+  assert.equal(deriveShortTrackName('   .mp3'), 'مقطع صوتي');
+
+  const tracks: MusicTrackRecord[] = [
+    {
+      id: 'a',
+      kind: 'file',
+      title: 'نشيد الفجر',
+      fileName: 'fajr_nasheed.mp3',
+      duration: 90,
+      size: 1000,
+      order: 0,
+      favorite: true,
+      lastPlayedAt: 200,
+      tileColor: 'cobalt',
+      coverDataUrl: 'data:image/jpeg;base64,abc',
+      listIds: ['l1', 'l2'],
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    {
+      id: 'b',
+      kind: 'file',
+      title: 'مقطع هادئ',
+      fileName: 'calm.m4a',
+      duration: 120,
+      size: 2000,
+      order: 1,
+      favorite: false,
+      lastPlayedAt: 500,
+      listIds: ['l2'],
+      createdAt: 2,
+      updatedAt: 2,
+    },
+    {
+      id: 'c',
+      kind: 'radio',
+      title: 'إذاعة القرآن',
+      streamUrl: 'https://example.com/live',
+      duration: 0,
+      size: 0,
+      order: 2,
+      favorite: true,
+      createdAt: 3,
+      updatedAt: 3,
+    },
+  ];
+
+  assert.deepEqual(
+    getRecentPlayedTracks(tracks, 8).map((t) => t.id),
+    ['b', 'a']
+  );
+  assert.deepEqual(
+    filterTracksByTabAndQuery(tracks, { tab: 'favorites', query: '' }).map((t) => t.id),
+    ['a', 'c']
+  );
+  assert.deepEqual(
+    filterTracksByTabAndQuery(tracks, { tab: 'recent', query: '' }).map((t) => t.id),
+    ['b', 'a']
+  );
+  assert.deepEqual(
+    filterTracksByTabAndQuery(tracks, { tab: 'list:l2', query: 'هادئ' }).map((t) => t.id),
+    ['b']
+  );
+
+  // Backup keeps title/favorite/tileColor/listIds but excludes coverDataUrl and blobs
+  const backupTracks = buildMusicBackupTracks(tracks);
+  assert.equal(backupTracks[0].favorite, true);
+  assert.equal(backupTracks[0].tileColor, 'cobalt');
+  assert.deepEqual(backupTracks[0].listIds, ['l1', 'l2']);
+  assert.equal('coverDataUrl' in (backupTracks[0] as unknown as Record<string, unknown>), false);
+
+  const restored = mergeImportedMusicTracks([], new Set(['a']), backupTracks);
+  assert.equal(restored[0].favorite, true);
+  assert.equal(restored[0].tileColor, 'cobalt');
+  assert.deepEqual(restored[0].listIds, ['l1', 'l2']);
+  assert.equal(restored[0].missingFile, false);
+  assert.equal(restored[1].missingFile, true);
+});
+
 

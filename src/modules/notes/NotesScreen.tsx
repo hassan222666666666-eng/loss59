@@ -3,8 +3,6 @@ import {
   Check,
   CheckSquare,
   Copy,
-  EyeOff,
-  Flame,
   Image as ImageIcon,
   Plus,
   Search,
@@ -14,24 +12,24 @@ import {
   Undo2,
   X,
 } from 'lucide-react';
-import { AppSettings, KnownProduct, NoteItem } from '../../types';
+import { AppSettings, NoteItem } from '../../types';
 import {
   deleteNoteById,
   deleteNotesBulk,
   getAllNotes,
-  getTopPulledProducts,
   saveNote,
   saveNotesBulk,
-  setOptionalProductName,
-  setProductHiddenFromTopStrip,
 } from '../db';
 import { formatDayHeading, getLocalDateKey } from '../../utils/arabicText';
 import { NoteEditorView } from './NoteEditorView';
 import { formatNoteForCopy } from './noteFormat';
+import { formatSentTimestampArabic } from './whatsapp';
 
 interface NotesScreenProps {
   settings: AppSettings;
   refreshSignal: number;
+  onUpdateSettings: (partial: Partial<AppSettings>) => Promise<void>;
+  onKeyboardOpenChange?: (isOpen: boolean) => void;
 }
 
 const SwipeableNoteCard: React.FC<{
@@ -100,17 +98,12 @@ const SwipeableNoteCard: React.FC<{
 export const NotesScreen: React.FC<NotesScreenProps> = ({
   settings,
   refreshSignal,
+  onUpdateSettings,
+  onKeyboardOpenChange,
 }) => {
   const [notes, setNotes] = useState<NoteItem[]>([]);
-  const [topPulled, setTopPulled] = useState<KnownProduct[]>([]);
-  const [hasEnoughDays, setHasEnoughDays] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
-
-  // Selected product from "يُسحب كثيراً" strip
-  const [selectedTopProduct, setSelectedTopProduct] =
-    useState<KnownProduct | null>(null);
-  const [editingProductName, setEditingProductName] = useState('');
 
   // Undo toast for swiped / bulk-deleted notes
   const [undoNotes, setUndoNotes] = useState<NoteItem[] | null>(null);
@@ -124,76 +117,31 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
   const [copiedSelected, setCopiedSelected] = useState(false);
 
   const loadNotesData = useCallback(async () => {
-    const [allNotes, pulled] = await Promise.all([
-      getAllNotes(),
-      getTopPulledProducts(12),
-    ]);
+    const allNotes = await getAllNotes();
     setNotes(allNotes);
-    setTopPulled(pulled.products);
-    setHasEnoughDays(pulled.hasEnoughDays);
   }, []);
 
   useEffect(() => {
     loadNotesData();
   }, [loadNotesData, refreshSignal]);
 
-  const handleCreateNote = async (initialProduct?: KnownProduct) => {
+  const handleCreateNote = async () => {
     const now = Date.now();
     const newNote: NoteItem = {
       id: `note_${now}_${Math.random().toString(36).slice(2, 6)}`,
-      title: initialProduct?.productName ? initialProduct.productName : '',
+      title: '',
       body: '',
-      photos: initialProduct?.thumbnailDataUrl
-        ? [
-            {
-              id: `np_${now}`,
-              dataUrl: initialProduct.thumbnailDataUrl,
-              createdAt: now,
-            },
-          ]
-        : [],
+      photos: [],
       numberingEnabled: settings.defaultNoteNumbering,
       resetAfterBlankLine: false,
+      quantitiesEnabled: settings.defaultNoteQuantities !== false,
+      lineQuantities: [],
       createdAt: now,
       updatedAt: now,
     };
     await saveNote(newNote);
     await loadNotesData();
-    setSelectedTopProduct(null);
     setActiveNoteId(newNote.id);
-  };
-
-  const handleAppendProductToNote = async (
-    targetNote: NoteItem,
-    product: KnownProduct
-  ) => {
-    const now = Date.now();
-    const updatedPhotos = product.thumbnailDataUrl
-      ? [
-          ...(targetNote.photos || []),
-          {
-            id: `np_${now}`,
-            dataUrl: product.thumbnailDataUrl,
-            createdAt: now,
-          },
-        ]
-      : targetNote.photos || [];
-    const optionalLine = product.productName
-      ? targetNote.body
-        ? `${targetNote.body}\n${product.productName}`
-        : product.productName
-      : targetNote.body;
-
-    const updated: NoteItem = {
-      ...targetNote,
-      body: optionalLine,
-      photos: updatedPhotos,
-      updatedAt: now,
-    };
-    await saveNote(updated);
-    await loadNotesData();
-    setSelectedTopProduct(null);
-    setActiveNoteId(updated.id);
   };
 
   const handleDeleteNoteWithUndo = async (note: NoteItem) => {
@@ -288,6 +236,11 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
           body: n.body,
           numberingEnabled: Boolean(n.numberingEnabled),
           resetAfterBlankLine: Boolean(n.resetAfterBlankLine),
+          quantitiesEnabled: Boolean(n.quantitiesEnabled),
+          lineQuantities: n.lineQuantities || [],
+          sortOrder: settings.noteCopySortOrder || 'as-written',
+          digitStyle: settings.noteCopyDigitStyle || 'western',
+          includeTotalQuantities: Boolean(settings.noteCopyIncludeTotalQuantities),
         })
       )
       .filter(Boolean)
@@ -395,50 +348,6 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
       </header>
 
       <main className="max-w-5xl mx-auto px-4 pt-4 space-y-6">
-        {/* Top Strip: "يُسحب كثيراً" (Visual pictures + small flame icon, ZERO numbers/counts/percentages) */}
-        <section className="space-y-2.5">
-          <div className="flex items-center gap-1.5 px-1">
-            <Flame className="w-4 h-4 text-amber-500" />
-            <h2 className="text-base font-extrabold text-slate-900 dark:text-white">
-              يُسحب كثيراً
-            </h2>
-          </div>
-
-          {!hasEnoughDays ? (
-            <div className="bg-white dark:bg-slate-900 rounded-[20px] p-4 border border-slate-200/80 dark:border-slate-800 shadow-sm text-sm font-semibold text-slate-500 dark:text-slate-400">
-              ستظهر هنا المواد الأكثر سحباً بعد عدة أيام
-            </div>
-          ) : topPulled.length === 0 ? (
-            <div className="bg-white dark:bg-slate-900 rounded-[20px] p-4 border border-slate-200/80 dark:border-slate-800 shadow-sm text-sm font-semibold text-slate-500 dark:text-slate-400">
-              ستظهر هنا المواد الأكثر سحباً بعد عدة أيام
-            </div>
-          ) : (
-            <div className="flex items-center gap-2.5 overflow-x-auto pb-1">
-              {topPulled.map((kp) => (
-                <button
-                  key={kp.id}
-                  type="button"
-                  onClick={() => {
-                    setEditingProductName(kp.productName || '');
-                    setSelectedTopProduct(kp);
-                  }}
-                  className="relative w-24 h-24 rounded-2xl overflow-hidden bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 shadow-sm shrink-0 active:scale-95 transition"
-                  aria-label={kp.productName || 'منتج يُسحب كثيراً'}
-                >
-                  <img
-                    src={kp.thumbnailDataUrl}
-                    alt={kp.productName || 'منتج'}
-                    className="w-full h-full object-cover"
-                  />
-                  <span className="absolute top-1.5 right-1.5 w-6 h-6 rounded-full bg-white/90 dark:bg-slate-900/90 text-amber-500 flex items-center justify-center shadow">
-                    <Flame className="w-3.5 h-3.5 fill-amber-500" />
-                  </span>
-                </button>
-              ))}
-            </div>
-          )}
-        </section>
-
         {/* Notes List */}
         <section className="space-y-2.5">
           {filteredNotes.length === 0 ? (
@@ -499,13 +408,18 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
                           {firstLine}
                         </div>
                       )}
-                      <div className="text-xs text-slate-400 flex items-center gap-2">
+                      <div className="text-xs text-slate-400 flex items-center flex-wrap gap-x-2 gap-y-0.5">
                         <span>{dateLabel}</span>
                         {note.photos && note.photos.length > 0 && (
                           <>
                             <span aria-hidden="true">·</span>
                             <ImageIcon className="w-3.5 h-3.5 inline" />
                           </>
+                        )}
+                        {note.lastSentAt && (
+                          <span className="text-emerald-600 dark:text-emerald-400 font-semibold">
+                            · أُرسلت · {formatSentTimestampArabic(note.lastSentAt)}
+                          </span>
                         )}
                       </div>
                     </div>
@@ -535,105 +449,6 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
           )}
         </section>
       </main>
-
-      {/* Top Pulled Product Modal: Large View + "إضافة إلى ملاحظة" + "إخفاء" */}
-      {selectedTopProduct && (
-        <div
-          className="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-sm flex items-end sm:items-center justify-center p-4"
-          onClick={() => setSelectedTopProduct(null)}
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            className="bg-white dark:bg-slate-900 w-full max-w-md rounded-[20px] p-5 shadow-2xl border border-slate-200 dark:border-slate-800 space-y-4 max-h-[88vh] overflow-y-auto"
-          >
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-1.5 text-sm font-extrabold text-slate-900 dark:text-white">
-                <Flame className="w-4 h-4 text-amber-500 fill-amber-500" />
-                <span>يُسحب كثيراً</span>
-              </div>
-              <button
-                type="button"
-                onClick={() => setSelectedTopProduct(null)}
-                className="w-10 h-10 rounded-xl bg-[#F7F8FA] dark:bg-slate-800 text-slate-500 flex items-center justify-center"
-                aria-label="إغلاق"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <div className="flex justify-center">
-              <img
-                src={selectedTopProduct.thumbnailDataUrl}
-                alt={selectedTopProduct.productName || 'المنتج'}
-                className="w-48 h-48 rounded-2xl object-cover bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700"
-              />
-            </div>
-
-            <input
-              type="text"
-              value={editingProductName}
-              onChange={(e) => setEditingProductName(e.target.value)}
-              onBlur={async () => {
-                if (editingProductName !== selectedTopProduct.productName) {
-                  await setOptionalProductName(
-                    selectedTopProduct.id,
-                    editingProductName
-                  );
-                  await loadNotesData();
-                }
-              }}
-              placeholder="اسم اختياري للمنتج..."
-              className="w-full min-h-[48px] px-4 rounded-2xl bg-[#F7F8FA] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-sm font-semibold text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-emerald-500"
-            />
-
-            <div className="space-y-2">
-              <button
-                type="button"
-                onClick={() => handleCreateNote(selectedTopProduct)}
-                className="min-h-[52px] w-full rounded-2xl bg-emerald-500 text-white font-extrabold text-sm flex items-center justify-center gap-2 active:scale-95 transition"
-              >
-                <Plus className="w-5 h-5" />
-                <span>إضافة إلى ملاحظة</span>
-              </button>
-
-              {notes.length > 0 && (
-                <div className="space-y-1.5 pt-1">
-                  <div className="text-xs font-bold text-slate-500 dark:text-slate-400">
-                    أو أضف إلى ملاحظة موجودة:
-                  </div>
-                  <div className="max-h-32 overflow-y-auto space-y-1.5">
-                    {notes.slice(0, 4).map((n) => (
-                      <button
-                        key={n.id}
-                        type="button"
-                        onClick={() =>
-                          handleAppendProductToNote(n, selectedTopProduct)
-                        }
-                        className="w-full min-h-[44px] px-3 rounded-xl bg-[#F7F8FA] dark:bg-slate-800 text-slate-800 dark:text-slate-100 text-xs font-bold text-right truncate"
-                      >
-                        {n.title.trim() || 'ملاحظة بدون عنوان'}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              <button
-                type="button"
-                onClick={async () => {
-                  await setProductHiddenFromTopStrip(selectedTopProduct.id, true);
-                  setSelectedTopProduct(null);
-                  await loadNotesData();
-                }}
-                className="min-h-[52px] w-full rounded-2xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold text-sm flex items-center justify-center gap-2 active:scale-95 transition"
-              >
-                <EyeOff className="w-4 h-4" />
-                <span>إخفاء</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Bulk Selection Action Bar (fixed above BottomNav) */}
       {selectionMode && selectedNoteIds.size > 0 && (
@@ -693,11 +508,29 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
       {activeNote && (
         <NoteEditorView
           note={activeNote}
+          includeTotalInWhatsApp={Boolean(settings.includeTotalInWhatsApp)}
+          defaultNoteNumbering={Boolean(settings.defaultNoteNumbering)}
+          defaultNoteQuantities={settings.defaultNoteQuantities !== false}
+          noteCopySortOrder={settings.noteCopySortOrder || 'as-written'}
+          noteCopyDigitStyle={settings.noteCopyDigitStyle || 'western'}
+          noteCopyIncludeTotalQuantities={Boolean(
+            settings.noteCopyIncludeTotalQuantities
+          )}
+          onToggleIncludeTotalInWhatsApp={(next) => {
+            onUpdateSettings({ includeTotalInWhatsApp: next }).catch(() => {});
+          }}
+          onUpdateNoteSettings={(partial) => {
+            onUpdateSettings(partial).catch(() => {});
+          }}
           onChangeNote={async (updated) => {
             await saveNote(updated);
             await loadNotesData();
           }}
-          onClose={() => setActiveNoteId(null)}
+          onKeyboardOpenChange={onKeyboardOpenChange}
+          onClose={() => {
+            onKeyboardOpenChange?.(false);
+            setActiveNoteId(null);
+          }}
         />
       )}
     </div>

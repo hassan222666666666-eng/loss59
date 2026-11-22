@@ -20,7 +20,7 @@ function calcTargetDims(
   maxDim: number
 ): { width: number; height: number } {
   if (width <= 0 || height <= 0) return { width: 1, height: 1 };
-  if (width <= maxDim && height <= maxDim) {
+  if (!Number.isFinite(maxDim) || maxDim <= 0 || (width <= maxDim && height <= maxDim)) {
     return { width: Math.round(width), height: Math.round(height) };
   }
   if (width >= height) {
