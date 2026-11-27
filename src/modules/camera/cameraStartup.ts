@@ -1,7 +1,7 @@
 export const CAMERA_START_TIMEOUT_MS = 6000;
 export const CAMERA_RETRY_DELAYS_MS = [500, 1000, 2000] as const;
 export const CAMERA_BACKGROUND_RETRY_MS = 5000;
-export const CAMERA_TAKE_PHOTO_TIMEOUT_MS = 3000;
+export const CAMERA_TAKE_PHOTO_TIMEOUT_MS = 2000;
 export const CAMERA_ZOOM_FOCUS_SETTLE_MS = 300;
 export const CAMERA_POST_PLAY_APPLY_DELAY_MS = 300;
 
@@ -38,10 +38,23 @@ export interface ExtendedTrackCapabilities {
  *   starts at 1280x720 and falls back down to `{ video: true }`.
  */
 export function buildCameraConstraintAttempts(
-  highQuality: boolean = true,
-  targetDeviceId?: string | null
+  qualityOrRes: boolean | 'auto' | '1080p' | '720p' = true,
+  targetDeviceId?: string | null,
+  targetFrameRate?: number
 ): MediaStreamConstraints[] {
+  const highQuality = qualityOrRes !== false && qualityOrRes !== '720p';
   const cleanDeviceId = targetDeviceId?.trim();
+  const hasExplicitFps =
+    typeof targetFrameRate === 'number' &&
+    Number.isFinite(targetFrameRate) &&
+    targetFrameRate > 0;
+  const primaryFrameRateConstraint: MediaTrackConstraints['frameRate'] =
+    hasExplicitFps
+      ? { ideal: targetFrameRate, max: targetFrameRate }
+      : { ideal: 30 };
+  const relaxedFrameRateConstraint: MediaTrackConstraints['frameRate'] =
+    hasExplicitFps ? { ideal: targetFrameRate } : { ideal: 30 };
+
   if (cleanDeviceId) {
     const preferredWidth = highQuality ? 1920 : 1280;
     const preferredHeight = highQuality ? 1080 : 720;
@@ -52,7 +65,7 @@ export function buildCameraConstraintAttempts(
           deviceId: { exact: cleanDeviceId },
           width: { ideal: preferredWidth },
           height: { ideal: preferredHeight },
-          frameRate: { ideal: 30 },
+          frameRate: primaryFrameRateConstraint,
         },
       },
       {
@@ -61,7 +74,7 @@ export function buildCameraConstraintAttempts(
           deviceId: { exact: cleanDeviceId },
           width: { ideal: preferredWidth },
           height: { ideal: preferredHeight },
-          frameRate: { ideal: 30 },
+          frameRate: relaxedFrameRateConstraint,
         },
       },
       {
@@ -87,7 +100,7 @@ export function buildCameraConstraintAttempts(
           facingMode: { ideal: 'environment' },
           width: { min: 1280, ideal: 1920 },
           height: { min: 720, ideal: 1080 },
-          frameRate: { ideal: 30 },
+          frameRate: primaryFrameRateConstraint,
         },
       },
       {
@@ -96,7 +109,7 @@ export function buildCameraConstraintAttempts(
           facingMode: { ideal: 'environment' },
           width: { ideal: 1280 },
           height: { ideal: 720 },
-          frameRate: { ideal: 30 },
+          frameRate: relaxedFrameRateConstraint,
         },
       },
       {
@@ -119,7 +132,7 @@ export function buildCameraConstraintAttempts(
         facingMode: { ideal: 'environment' },
         width: { ideal: 1280 },
         height: { ideal: 720 },
-        frameRate: { ideal: 30 },
+        frameRate: primaryFrameRateConstraint,
       },
     },
     {
@@ -313,6 +326,8 @@ export async function acquireStreamWithTimeout(
 export async function startCameraWithRetryLadder(options: {
   getUserMedia: (constraints: MediaStreamConstraints) => Promise<MediaStream>;
   highQuality?: boolean;
+  previewResolution?: 'auto' | '1080p' | '720p';
+  frameRate?: number;
   targetDeviceId?: string | null;
   isCancelled?: () => boolean;
   beforeAttempt?: (attemptIndex: number) => void | Promise<void>;
@@ -321,8 +336,9 @@ export async function startCameraWithRetryLadder(options: {
   sleep?: (ms: number) => Promise<void>;
 }): Promise<MediaStream> {
   const attempts = buildCameraConstraintAttempts(
-    options.highQuality ?? true,
-    options.targetDeviceId
+    options.previewResolution ?? (options.highQuality ?? true),
+    options.targetDeviceId,
+    options.frameRate
   );
   const delays = options.retryDelaysMs ?? CAMERA_RETRY_DELAYS_MS;
   const timeoutMs = options.timeoutMs ?? CAMERA_START_TIMEOUT_MS;

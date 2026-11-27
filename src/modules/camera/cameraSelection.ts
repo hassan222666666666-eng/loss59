@@ -183,3 +183,38 @@ export function extractZoomRangeFromCapabilities(caps?: {
       : {}),
   };
 }
+
+export const ZOOM_PRESETS = [1, 2, 3] as const;
+
+/**
+ * Returns supported zoom presets (1x, 2x, 3x) ONLY when the camera track natively supports zoom.
+ * If the track does not support zoom (or max <= 1.2), returns [] so 2x/3x UI controls stay hidden
+ * and the preview is never scaled with CSS.
+ */
+export function resolveAvailableZoomPresets(
+  zoomRange: CameraZoomRangeInfo | null | undefined
+): number[] {
+  if (
+    !zoomRange ||
+    !Number.isFinite(zoomRange.min) ||
+    !Number.isFinite(zoomRange.max) ||
+    zoomRange.max <= zoomRange.min ||
+    zoomRange.max < 1.5
+  ) {
+    return [];
+  }
+  const presets = ZOOM_PRESETS.filter(
+    (p) => p >= zoomRange.min - 0.05 && p <= zoomRange.max + 0.05
+  );
+  return presets.length >= 2 ? presets : [];
+}
+
+export function clampHardwareZoom(
+  requested: number,
+  zoomRange: CameraZoomRangeInfo | null | undefined
+): number {
+  if (!zoomRange || zoomRange.max <= zoomRange.min) return 1;
+  const clamped = Math.max(zoomRange.min, Math.min(zoomRange.max, requested));
+  return Math.round(clamped * 10) / 10;
+}
+

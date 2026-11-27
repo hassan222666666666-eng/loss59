@@ -13,7 +13,7 @@ export const AUTO_FLASH_DEFAULTS = {
   baseHighLumaThreshold: 165,
   maxHighLumaThreshold: 215,
   maxDarkRatioToTurnOff: 0.08,
-  sampleIntervalMs: 300,
+  sampleIntervalMs: 500,
   veryDarkHoldMs: 200,
   turnOnHoldMs: 400,
   turnOffHoldMs: 1000,

@@ -30,7 +30,11 @@ export const BottomNav: React.FC<BottomNavProps> = ({
 
   return (
     <nav
-      className="fixed bottom-0 inset-x-0 z-40 bg-white/95 dark:bg-slate-900/95 backdrop-blur-lg border-t border-slate-200 dark:border-slate-800 pb-safe shadow-[0_-4px_16px_rgba(0,0,0,0.04)]"
+      className={`fixed bottom-0 inset-x-0 z-40 border-t border-slate-200 dark:border-slate-800 pb-safe ${
+        activeTab === 'capture'
+          ? 'bg-white dark:bg-slate-900'
+          : 'bg-white/95 dark:bg-slate-900/95 backdrop-blur-lg shadow-[0_-4px_16px_rgba(0,0,0,0.04)]'
+      }`}
       dir="rtl"
       role="navigation"
       aria-label="شريط التنقل السفلي"

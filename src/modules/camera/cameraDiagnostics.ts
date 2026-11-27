@@ -1,8 +1,22 @@
+import { CaptureMode, PhotoEnhanceLevel } from '../../types';
+import { formatBytesArabic } from '../../utils/arabicText';
 import type { CameraCandidateRecord } from './cameraSelection';
+import { formatCaptureModeLabel } from './captureQueue';
+import { formatEnhanceLevelLabel } from './photoEnhancement';
+
+export type CameraCaptureMethod =
+  | 'takePhoto'
+  | 'videoFrame'
+  | 'gallery'
+  | 'nativeCamera';
 
 export interface CameraDiagnosticsInfo {
   previewWidth?: number;
   previewHeight?: number;
+  requestedPreviewWidth?: number;
+  requestedPreviewHeight?: number;
+  requestedFrameRate?: number;
+  previewDowngraded?: boolean;
   frameRate?: number;
   takePhotoSupported?: boolean;
   maxPhotoWidth?: number;
@@ -10,9 +24,15 @@ export interface CameraDiagnosticsInfo {
   focusMode?: string;
   exposureMode?: string;
   whiteBalanceMode?: string;
+  lastCaptureMode?: CaptureMode;
+  lastCaptureTimestamp?: number;
+  lastCaptureMs?: number;
+  lastProcessingMs?: number;
+  lastSavingMs?: number;
   lastSavedPhotoWidth?: number;
   lastSavedPhotoHeight?: number;
-  lastSavedPhotoMethod?: 'takePhoto' | 'videoFrame' | 'gallery';
+  lastSavedPhotoBytes?: number;
+  lastSavedPhotoMethod?: CameraCaptureMethod;
   torchSupported?: boolean;
   requestedTorch?: boolean;
   actualTorch?: boolean | null;
@@ -25,6 +45,11 @@ export interface CameraDiagnosticsInfo {
   cameraProbeSignature?: string | null;
   noTorchCandidateFound?: boolean;
   candidates?: CameraCandidateRecord[];
+  lastEnhanceMs?: number;
+  lastEnhanceBeforeLuminance?: number;
+  lastEnhanceAfterLuminance?: number;
+  lastEnhanceLevel?: PhotoEnhanceLevel;
+  lastEnhanceFailed?: boolean;
   updatedAt?: number;
 }
 
@@ -67,6 +92,21 @@ export interface CameraDiagnosticsDisplayRow {
   value: string;
 }
 
+function formatCaptureTimestampArabic(ts?: number): string {
+  if (!ts || !Number.isFinite(ts) || ts <= 0) {
+    return 'لم يُلتقط بعد';
+  }
+  try {
+    return new Intl.DateTimeFormat('ar-EG', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    }).format(new Date(ts));
+  } catch {
+    return new Date(ts).toLocaleTimeString();
+  }
+}
+
 export function formatCameraCandidateSummary(
   cand: CameraCandidateRecord,
   isInUse: boolean
@@ -95,27 +135,61 @@ export function formatCameraCandidateSummary(
 
 export function buildCameraDiagnosticsRows(
   info: CameraDiagnosticsInfo,
-  fallbackLastPhoto?: { width?: number; height?: number } | null
+  fallbackLastPhoto?: { width?: number; height?: number; bytes?: number } | null,
+  activeCaptureMode?: CaptureMode
 ): CameraDiagnosticsDisplayRow[] {
-  const previewText =
+  const actualPreviewText =
     info.previewWidth && info.previewHeight
       ? `${info.previewWidth} × ${info.previewHeight}${
           info.frameRate ? ` (${Math.round(info.frameRate)} إطار/ث)` : ''
         }`
       : 'غير متاحة (افتح الكاميرا أولاً)';
+  const hasRequestedInfo = Boolean(
+    info.requestedPreviewWidth && info.requestedPreviewHeight
+  );
+  const previewText = hasRequestedInfo
+    ? `${actualPreviewText} · المطلوب ${info.requestedPreviewWidth} × ${
+        info.requestedPreviewHeight
+      }${info.requestedFrameRate ? ` (${info.requestedFrameRate} إطار/ث)` : ''}${
+        info.previewDowngraded ? ' (خُفضت تلقائياً)' : ''
+      }`
+    : actualPreviewText;
+
+  const effectiveMode = activeCaptureMode ?? info.lastCaptureMode;
+  const captureModeText = formatCaptureModeLabel(effectiveMode);
+  const lastCaptureTimeText = formatCaptureTimestampArabic(info.lastCaptureTimestamp);
+
+  const hasStageTimings =
+    typeof info.lastCaptureMs === 'number' ||
+    typeof info.lastProcessingMs === 'number' ||
+    typeof info.lastSavingMs === 'number';
+  const stageTimingsText = hasStageTimings
+    ? `التقاط: ${Math.round(info.lastCaptureMs ?? 0)} م.ث · معالجة: ${Math.round(
+        info.lastProcessingMs ?? 0
+      )} م.ث · حفظ: ${Math.round(info.lastSavingMs ?? 0)} م.ث`
+    : 'لم تُقَس بعد';
 
   const lastW = info.lastSavedPhotoWidth ?? fallbackLastPhoto?.width;
   const lastH = info.lastSavedPhotoHeight ?? fallbackLastPhoto?.height;
+  const lastBytes = info.lastSavedPhotoBytes ?? fallbackLastPhoto?.bytes;
   const methodLabel =
     info.lastSavedPhotoMethod === 'takePhoto'
       ? ' · takePhoto'
       : info.lastSavedPhotoMethod === 'videoFrame'
       ? ' · إطار فيديو'
+      : info.lastSavedPhotoMethod === 'nativeCamera'
+      ? ' · كاميرا الهاتف'
       : info.lastSavedPhotoMethod === 'gallery'
       ? ' · المعرض'
       : '';
+  const sizeLabel =
+    typeof lastBytes === 'number' && lastBytes > 0
+      ? ` · ${formatBytesArabic(lastBytes)}`
+      : '';
   const lastPhotoText =
-    lastW && lastH ? `${lastW} × ${lastH}${methodLabel}` : 'لم تُحفظ صورة بعد';
+    lastW && lastH
+      ? `${lastW} × ${lastH}${sizeLabel}${methodLabel}`
+      : 'لم تُحفظ صورة بعد';
 
   const takePhotoText =
     info.takePhotoSupported === undefined
@@ -161,8 +235,11 @@ export function buildCameraDiagnosticsRows(
     : 'لم تُرسل قيود بعد';
 
   const rows: CameraDiagnosticsDisplayRow[] = [
+    { label: 'نمط الالتقاط', value: captureModeText },
+    { label: 'وقت آخر التقاط', value: lastCaptureTimeText },
+    { label: 'مراحل آخر التقاط (م.ث)', value: stageTimingsText },
+    { label: 'دقة وحجم آخر صورة محفوظة', value: lastPhotoText },
     { label: 'دقة المعاينة الفعلية', value: previewText },
-    { label: 'دقة آخر صورة محفوظة', value: lastPhotoText },
     { label: 'التقاط الحساس (takePhoto)', value: takePhotoText },
     {
       label: 'التركيز والتعريض النشط',
@@ -174,6 +251,38 @@ export function buildCameraDiagnosticsRows(
     { label: 'آخر خطأ applyConstraints', value: lastErrorText },
     { label: 'آخر قيود مُرسلة', value: lastConstraintsText },
   ];
+
+  const hasEnhanceMetrics =
+    typeof info.lastEnhanceMs === 'number' ||
+    typeof info.lastEnhanceBeforeLuminance === 'number' ||
+    info.lastEnhanceLevel !== undefined ||
+    info.lastEnhanceFailed === true;
+  if (hasEnhanceMetrics) {
+    const levelLabel = formatEnhanceLevelLabel(info.lastEnhanceLevel);
+    const timeText =
+      typeof info.lastEnhanceMs === 'number'
+        ? `${Math.round(info.lastEnhanceMs)} م.ث`
+        : '—';
+    const lumaText =
+      typeof info.lastEnhanceBeforeLuminance === 'number' &&
+      typeof info.lastEnhanceAfterLuminance === 'number'
+        ? `${Math.round(info.lastEnhanceBeforeLuminance)} → ${Math.round(
+            info.lastEnhanceAfterLuminance
+          )}`
+        : '—';
+    rows.push(
+      {
+        label: 'تحسين الصور الأخير',
+        value: info.lastEnhanceFailed
+          ? `فشل/تجاوز المهلة (${levelLabel} · ${timeText})`
+          : `${levelLabel} · ${timeText}`,
+      },
+      {
+        label: 'متوسط السطوع (قبل ← بعد)',
+        value: lumaText,
+      }
+    );
+  }
 
   if (Array.isArray(info.candidates) && info.candidates.length > 0) {
     for (const cand of info.candidates) {
@@ -194,9 +303,14 @@ export function buildCameraDiagnosticsRows(
 
 export function formatCameraDiagnosticsClipboardText(
   info: CameraDiagnosticsInfo,
-  fallbackLastPhoto?: { width?: number; height?: number } | null
+  fallbackLastPhoto?: { width?: number; height?: number; bytes?: number } | null,
+  activeCaptureMode?: CaptureMode
 ): string {
-  const rows = buildCameraDiagnosticsRows(info, fallbackLastPhoto);
+  const rows = buildCameraDiagnosticsRows(
+    info,
+    fallbackLastPhoto,
+    activeCaptureMode
+  );
   return ['معلومات الكاميرا:', ...rows.map((r) => `- ${r.label}: ${r.value}`)].join(
     '\n'
   );

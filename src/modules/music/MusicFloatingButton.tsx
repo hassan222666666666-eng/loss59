@@ -24,6 +24,7 @@ interface MusicFloatingButtonProps {
   sleepRemainingSec: number;
   colorPresetId: MusicFabColorId;
   visualEffects: boolean;
+  disableEffects?: boolean;
   reactiveLevels?: readonly [number, number, number] | null;
   onTapOpen: () => void;
   onLongPressTogglePlay: () => void;
@@ -37,6 +38,7 @@ export const MusicFloatingButton: React.FC<MusicFloatingButtonProps> = ({
   sleepRemainingSec,
   colorPresetId,
   visualEffects,
+  disableEffects = false,
   reactiveLevels = null,
   onTapOpen,
   onLongPressTogglePlay,
@@ -99,9 +101,9 @@ export const MusicFloatingButton: React.FC<MusicFloatingButtonProps> = ({
     }, MUSIC_IDLE_FADE_DELAY_MS);
   }, []);
 
-  // Track idle state: fades to ~35% & shrinks slightly after 4s without touch or scroll
+  // Track idle state: fades to ~35% & shrinks slightly after 4s without touch or scroll; paused when hidden
   useEffect(() => {
-    if (!visible) {
+    if (!visible || isPageHidden) {
       setIsIdle(false);
       if (idleTimerRef.current !== null) {
         window.clearTimeout(idleTimerRef.current);
@@ -138,7 +140,7 @@ export const MusicFloatingButton: React.FC<MusicFloatingButtonProps> = ({
         idleTimerRef.current = null;
       }
     };
-  }, [visible, resetIdleTimer]);
+  }, [visible, isPageHidden, resetIdleTimer]);
 
   // Pause CSS animations when document is hidden (visibilitychange)
   useEffect(() => {
@@ -158,12 +160,13 @@ export const MusicFloatingButton: React.FC<MusicFloatingButtonProps> = ({
       nextId !== prevTrackIdRef.current &&
       isPlaying &&
       visualEffects &&
+      !disableEffects &&
       !isPageHidden
     ) {
       setFlashKey((k) => k + 1);
     }
     prevTrackIdRef.current = nextId;
-  }, [currentTrack?.id, isPlaying, visualEffects, isPageHidden]);
+  }, [currentTrack?.id, isPlaying, visualEffects, disableEffects, isPageHidden]);
 
   // Re-clamp vertical position cleanly on viewport resize
   useEffect(() => {
@@ -194,8 +197,8 @@ export const MusicFloatingButton: React.FC<MusicFloatingButtonProps> = ({
   const preset = resolveMusicFabColorPreset(colorPresetId);
   const timerText =
     sleepRemainingSec > 0 ? formatSleepTimerBadge(sleepRemainingSec) : '';
-  const animationsPaused = isPageHidden || !visualEffects;
-  const showPlayingEffects = isPlaying && visualEffects;
+  const animationsPaused = disableEffects || isPageHidden || !visualEffects;
+  const showPlayingEffects = isPlaying && visualEffects && !disableEffects;
 
   const handlePointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
     if (e.button !== 0 && e.pointerType === 'mouse') return;

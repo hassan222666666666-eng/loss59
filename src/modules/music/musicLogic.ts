@@ -20,11 +20,19 @@ export const AUDIO_FILE_EXTENSIONS = [
   'mp4',
   'aac',
   'ogg',
+  'oga',
   'opus',
   'wav',
   'flac',
   'webm',
   'wma',
+  'amr',
+  '3gp',
+  '3ga',
+  'm4b',
+  'aiff',
+  'aif',
+  'caf',
 ] as const;
 
 export interface MusicFabColorPreset {
@@ -157,7 +165,7 @@ export function isSupportedAudioFile(file: {
   if (!file || typeof file !== 'object') return false;
   if (typeof file.size === 'number' && file.size <= 0) return false;
   const mime = (file.type || '').trim().toLowerCase();
-  if (mime.startsWith('audio/')) return true;
+  if (mime.startsWith('audio/') || mime === 'application/ogg') return true;
   const name = (file.name || '').trim().toLowerCase();
   const dotIdx = name.lastIndexOf('.');
   if (dotIdx === -1 || dotIdx === name.length - 1) return false;
@@ -169,19 +177,116 @@ export function makeAudioDuplicateKey(fileName: string, size: number): string {
   return `${(fileName || '').trim().toLowerCase()}::${Math.max(0, Number(size) || 0)}`;
 }
 
+export function normalizeAudioTitleForDuplicate(title: string): string {
+  return (title || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, ' ')
+    .trim();
+}
+
+export async function computeAudioContentHash(
+  buffer: ArrayBuffer
+): Promise<string> {
+  const view = new Uint8Array(buffer);
+  const subtle =
+    typeof globalThis !== 'undefined' ? globalThis.crypto?.subtle : undefined;
+  if (subtle && typeof subtle.digest === 'function') {
+    try {
+      const digest = await subtle.digest('SHA-256', view);
+      const bytes = new Uint8Array(digest);
+      let hex = '';
+      for (let i = 0; i < bytes.length; i++) {
+        hex += bytes[i].toString(16).padStart(2, '0');
+      }
+      return `sha256:${hex}`;
+    } catch {
+      // Fall through to deterministic FNV-1a fingerprint
+    }
+  }
+
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  const step = Math.max(1, Math.floor(view.length / 65536));
+  for (let i = 0; i < view.length; i += step) {
+    const b = view[i];
+    h1 ^= b;
+    h1 = Math.imul(h1, 0x01000193) >>> 0;
+    h2 ^= (b + i) & 0xff;
+    h2 = Math.imul(h2, 0x85ebca6b) >>> 0;
+  }
+  return `fnv:${view.length}:${h1.toString(16).padStart(8, '0')}${h2.toString(16).padStart(8, '0')}`;
+}
+
 export function isDuplicateAudioFile(
   existingTracks: ReadonlyArray<MusicTrackRecord>,
   seenKeys: ReadonlySet<string>,
   fileName: string,
-  size: number
+  size: number,
+  contentHash?: string,
+  seenHashes?: ReadonlySet<string>
 ): boolean {
   const key = makeAudioDuplicateKey(fileName, size);
   if (seenKeys.has(key)) return true;
+  if (contentHash && seenHashes?.has(contentHash)) return true;
+
+  return existingTracks.some((t) => {
+    if (t.kind !== 'file' || t.missingFile) return false;
+    if (makeAudioDuplicateKey(t.fileName || '', t.size) === key) {
+      return true;
+    }
+    if (contentHash && t.contentHash && t.contentHash === contentHash) {
+      return true;
+    }
+    return false;
+  });
+}
+
+export function isDuplicateAudioTitleAndDuration(
+  existingTracks: ReadonlyArray<MusicTrackRecord>,
+  seenTitleDurations: ReadonlyArray<{ titleNorm: string; duration: number }>,
+  title: string,
+  durationSec: number
+): boolean {
+  if (!Number.isFinite(durationSec) || durationSec <= 0) return false;
+  const titleNorm = normalizeAudioTitleForDuplicate(title);
+  if (!titleNorm) return false;
+
+  if (
+    seenTitleDurations.some(
+      (item) =>
+        item.titleNorm === titleNorm &&
+        item.duration > 0 &&
+        Math.abs(item.duration - durationSec) <= 1.0
+    )
+  ) {
+    return true;
+  }
+
   return existingTracks.some(
     (t) =>
       t.kind === 'file' &&
       !t.missingFile &&
-      makeAudioDuplicateKey(t.fileName || '', t.size) === key
+      t.duration > 0 &&
+      normalizeAudioTitleForDuplicate(t.title) === titleNorm &&
+      Math.abs(t.duration - durationSec) <= 1.0
+  );
+}
+
+export function normalizeRadioStreamUrl(rawUrl: string): string {
+  return (rawUrl || '').trim().toLowerCase().replace(/\/+$/, '');
+}
+
+export function isDuplicateRadioStation(
+  existingTracks: ReadonlyArray<MusicTrackRecord>,
+  streamUrl: string
+): boolean {
+  const target = normalizeRadioStreamUrl(streamUrl);
+  if (!target) return false;
+  return existingTracks.some(
+    (t) =>
+      t.kind === 'radio' &&
+      normalizeRadioStreamUrl(t.streamUrl || '') === target
   );
 }
 
@@ -479,6 +584,7 @@ export function buildMusicBackupTracks(
     streamUrl: t.kind === 'radio' ? t.streamUrl : undefined,
     duration: t.duration,
     size: t.size,
+    contentHash: t.contentHash,
     order: t.order,
     favorite: Boolean(t.favorite),
     lastPlayedAt: t.lastPlayedAt,
@@ -518,6 +624,7 @@ export function mergeImportedMusicTracks(
       streamUrl: kind === 'radio' && imp.streamUrl ? String(imp.streamUrl) : undefined,
       duration: Number.isFinite(imp.duration) ? Math.max(0, imp.duration) : 0,
       size: Number.isFinite(imp.size) ? Math.max(0, imp.size) : 0,
+      contentHash: imp.contentHash ? String(imp.contentHash) : prev?.contentHash,
       order: Number.isFinite(imp.order) ? imp.order : i,
       missingFile: kind === 'file' ? !hasLocalBlob : false,
       favorite: imp.favorite !== undefined ? Boolean(imp.favorite) : prev?.favorite,

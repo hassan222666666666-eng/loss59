@@ -9,7 +9,7 @@ import {
   Undo2,
   X,
 } from 'lucide-react';
-import { ShelfPhoto } from '../../types';
+import { AppSettings, ShelfPhoto } from '../../types';
 import {
   deletePhotoById,
   deletePhotosBulk,
@@ -18,6 +18,15 @@ import {
   savePhoto,
 } from '../db';
 import { rotateDataUrl90CW } from '../camera/imageCompression';
+import {
+  MAX_SAVED_PHOTO_LONG_SIDE,
+  SAVED_PHOTO_JPEG_QUALITY,
+} from '../camera/captureQueue';
+import {
+  reEnhancePhotoNow,
+  restoreOriginalPhotoRecord,
+} from '../camera/photoEnhancementQueue';
+import { resolveEnhanceLevel } from '../camera/photoEnhancement';
 import { formatDayHeading, formatTimeArabic } from '../../utils/arabicText';
 import { PWAInstallButton } from '../../components/PWAInstallButton';
 import { PhotoDetailView } from './PhotoDetailView';
@@ -27,6 +36,7 @@ type LogFilter = 'all' | 'unfinished' | 'done';
 const ROTATE_HINT_DISMISSED_KEY = 'naqs_alrofoof_rotate_hint_dismissed';
 
 interface LogScreenProps {
+  settings?: AppSettings;
   refreshSignal: number;
   focusPhotoId?: string | null;
   onClearFocusPhoto?: () => void;
@@ -111,6 +121,7 @@ const SwipeablePhotoCard: React.FC<SwipeableCardProps> = ({
 };
 
 export const LogScreen: React.FC<LogScreenProps> = ({
+  settings,
   refreshSignal,
   focusPhotoId,
   onClearFocusPhoto,
@@ -351,13 +362,46 @@ export const LogScreen: React.FC<LogScreenProps> = ({
 
   const handleRotateActivePhoto = async () => {
     if (!activePhoto || !activePhoto.dataUrl) return;
-    const rotated = await rotateDataUrl90CW(activePhoto.dataUrl, 2048, 0.9);
+    const rotated = await rotateDataUrl90CW(
+      activePhoto.dataUrl,
+      MAX_SAVED_PHOTO_LONG_SIDE,
+      SAVED_PHOTO_JPEG_QUALITY
+    );
+    let nextOriginalDataUrl = activePhoto.originalDataUrl;
+    if (activePhoto.originalDataUrl) {
+      try {
+        const rotatedOriginal = await rotateDataUrl90CW(
+          activePhoto.originalDataUrl,
+          MAX_SAVED_PHOTO_LONG_SIDE,
+          SAVED_PHOTO_JPEG_QUALITY
+        );
+        nextOriginalDataUrl = rotatedOriginal.dataUrl;
+      } catch {
+        // Keep existing original if rotation fails
+      }
+    }
     await savePhoto({
       ...activePhoto,
       dataUrl: rotated.dataUrl,
+      thumbnailDataUrl: rotated.thumbnailDataUrl,
+      ...(nextOriginalDataUrl ? { originalDataUrl: nextOriginalDataUrl } : {}),
       width: rotated.width,
       height: rotated.height,
     });
+    await loadData();
+  };
+
+  const handleReEnhanceActivePhoto = async () => {
+    if (!activePhoto) return;
+    const level =
+      resolveEnhanceLevel(settings?.photoEnhanceLevel) ?? 'medium';
+    await reEnhancePhotoNow(activePhoto, level);
+    await loadData();
+  };
+
+  const handleRestoreOriginalActivePhoto = async () => {
+    if (!activePhoto || !activePhoto.originalDataUrl) return;
+    await restoreOriginalPhotoRecord(activePhoto);
     await loadData();
   };
 
@@ -520,8 +564,10 @@ export const LogScreen: React.FC<LogScreenProps> = ({
                         >
                           {photo.dataUrl ? (
                             <img
-                              src={photo.dataUrl}
+                              src={photo.thumbnailDataUrl || photo.dataUrl}
                               alt="صورة الرف"
+                              decoding="async"
+                              loading="lazy"
                               className="w-full h-auto max-h-[56vh] object-contain block"
                             />
                           ) : (
@@ -530,6 +576,25 @@ export const LogScreen: React.FC<LogScreenProps> = ({
                               <span className="text-xs font-semibold">
                                 تم تنظيف الصورة لتوفير المساحة
                               </span>
+                            </div>
+                          )}
+
+                          {photo.enhancementStatus === 'pending' && photo.dataUrl && (
+                            <div
+                              data-testid="photo-enhancing-chip"
+                              className="absolute top-2.5 left-2.5 px-2 py-0.5 rounded-lg bg-slate-950/75 text-white text-[10px] font-extrabold flex items-center gap-1 backdrop-blur-sm"
+                            >
+                              <Loader2 className="w-3 h-3 animate-spin text-emerald-400" />
+                              <span>جاري التحسين</span>
+                            </div>
+                          )}
+
+                          {photo.enhancementStatus === 'unenhanced' && photo.dataUrl && (
+                            <div
+                              data-testid="photo-unenhanced-chip"
+                              className="absolute top-2.5 left-2.5 px-2 py-0.5 rounded-lg bg-amber-950/80 text-amber-200 text-[10px] font-bold backdrop-blur-sm"
+                            >
+                              بدون تحسين
                             </div>
                           )}
 
@@ -637,6 +702,8 @@ export const LogScreen: React.FC<LogScreenProps> = ({
           onCompletePhoto={handleCompleteActivePhoto}
           onSkipPhoto={handleSkipActivePhoto}
           onRotatePhoto={handleRotateActivePhoto}
+          onReEnhancePhoto={handleReEnhanceActivePhoto}
+          onRestoreOriginalPhoto={handleRestoreOriginalActivePhoto}
           onClose={() => {
             setActivePhotoId(null);
             setShowAllCompletedScreen(false);

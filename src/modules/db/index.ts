@@ -15,6 +15,7 @@ import {
   getAllMusicLists,
   getAllMusicTracks,
   getMusicPlaybackState,
+  getMusicStorageStats,
   restoreMusicBackupSection,
 } from '../music/musicDb';
 import { MusicBackupSection } from '../music/types';
@@ -29,6 +30,10 @@ import {
   sanitizePhotoRecord,
   sanitizeSettingsRecord,
 } from './backupSanitizer';
+import {
+  computeStorageBreakdown,
+  StorageBreakdown,
+} from './storageStats';
 
 const DB_NAME = 'naqs_alrofoof_db';
 const DB_VERSION = 11;
@@ -220,6 +225,32 @@ export async function savePhoto(photo: ShelfPhoto): Promise<void> {
   });
 }
 
+export async function savePhotosBatch(photos: ShelfPhoto[]): Promise<void> {
+  if (photos.length === 0) return;
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('photos', 'readwrite');
+    const store = tx.objectStore('photos');
+    for (const photo of photos) {
+      store.put(photo);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function getPhotoById(photoId: string): Promise<ShelfPhoto | null> {
+  const db = await initDB();
+  return new Promise((resolve) => {
+    const tx = db.transaction('photos', 'readonly');
+    const req = tx.objectStore('photos').get(photoId);
+    req.onsuccess = () => {
+      resolve(sanitizePhotoRecord(req.result));
+    };
+    req.onerror = () => resolve(null);
+  });
+}
+
 export async function getAllPhotos(): Promise<ShelfPhoto[]> {
   const db = await initDB();
   return new Promise((resolve) => {
@@ -302,6 +333,8 @@ export async function cleanupExpiredDonePhotos(
       store.put({
         ...p,
         dataUrl: '',
+        thumbnailDataUrl: '',
+        originalDataUrl: '',
         imageCleaned: true,
       });
     }
@@ -413,20 +446,23 @@ export async function saveSettings(
 
 // ----------------- STORAGE ESTIMATE -----------------
 
-export async function estimateStorageUsageBytes(): Promise<number> {
-  const [photos, notes] = await Promise.all([getAllPhotos(), getAllNotes()]);
+export async function getStorageBreakdown(): Promise<StorageBreakdown> {
+  const [photos, notes, musicStats] = await Promise.all([
+    getAllPhotos(),
+    getAllNotes(),
+    getMusicStorageStats().catch(() => null),
+  ]);
+  return computeStorageBreakdown({
+    photos,
+    notes,
+    audioBytes: musicStats?.usedBytes || 0,
+  });
+}
 
-  let localBytes = 0;
-  for (const p of photos) localBytes += (p.dataUrl?.length || 0) + 256;
-  for (const n of notes) {
-    localBytes += (n.title?.length || 0) * 2 + (n.body?.length || 0) * 2 + 256;
-    for (const np of n.photos || []) {
-      localBytes += np.dataUrl?.length || 0;
-    }
-    for (const lp of n.linePhotos || []) {
-      localBytes += lp.dataUrl?.length || 0;
-    }
-  }
+export type { StorageBreakdown };
+
+export async function estimateStorageUsageBytes(): Promise<number> {
+  const [breakdown] = await Promise.all([getStorageBreakdown()]);
 
   if (
     typeof navigator !== 'undefined' &&
@@ -436,13 +472,13 @@ export async function estimateStorageUsageBytes(): Promise<number> {
     try {
       const est = await navigator.storage.estimate();
       if (typeof est.usage === 'number' && est.usage > 0) {
-        return Math.max(est.usage, localBytes);
+        return Math.max(est.usage, breakdown.totalBytes);
       }
     } catch {
-      // Fallback to computed localBytes
+      // Fallback to computed breakdown total
     }
   }
-  return localBytes;
+  return breakdown.totalBytes;
 }
 
 // ----------------- BACKUP EXPORT / IMPORT / CLEAR -----------------

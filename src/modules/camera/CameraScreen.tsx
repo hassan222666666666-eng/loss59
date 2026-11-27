@@ -9,13 +9,16 @@ import {
   ZapOff,
   MoreHorizontal,
   ZoomIn,
+  Smartphone,
 } from 'lucide-react';
 import {
   AppSettings,
   FlashMode,
   ShelfPhoto,
 } from '../../types';
-import { savePhoto } from '../db';
+import {
+  getAllPhotos,
+} from '../db';
 import {
   checkImageBlurFromCanvas,
   DEFAULT_BLUR_THRESHOLD,
@@ -23,6 +26,7 @@ import {
 import {
   compressCanvasToJpeg,
   drawCroppedRotatedToCanvas,
+  estimateDataUrlBytes,
   fileOrDataUrlToCanvas,
   getVideoCaptureRotationDeg,
   processCaptureOffThread,
@@ -49,18 +53,31 @@ import {
   readTrackSettingsSnapshot,
 } from './cameraConstraints';
 import {
+  CameraCaptureMethod,
   readCameraDiagnostics,
   saveCameraDiagnostics,
 } from './cameraDiagnostics';
 import {
   CameraCandidateRecord,
   MAX_BACK_CAMERA_CANDIDATES,
+  ZOOM_PRESETS,
   areVideoDeviceLabelsEmpty,
+  clampHardwareZoom,
   computeDevicesSignature,
   extractZoomRangeFromCapabilities,
   pickBestTorchCandidate,
+  resolveAvailableZoomPresets,
   selectBackCameraCandidates,
 } from './cameraSelection';
+import {
+  FREEZE_OVERLAY_MAX_MS,
+  MAX_CAPTURE_QUEUE_PENDING,
+  MAX_SAVED_PHOTO_LONG_SIDE,
+  SAVED_PHOTO_JPEG_QUALITY,
+  THUMBNAIL_JPEG_QUALITY,
+  THUMBNAIL_MAX_LONG_SIDE,
+  resolveCaptureMode,
+} from './captureQueue';
 import { getLocalDateKey } from '../../utils/arabicText';
 import { playShutterSound, warmAudioContext } from '../../utils/sound';
 import {
@@ -71,45 +88,96 @@ import {
   isSceneDimForTorch,
   stepAutoFlashState,
 } from './autoFlashDecision';
+import { enqueuePhotoEnhancement } from './photoEnhancementQueue';
+import { resolveEnhanceLevel } from './photoEnhancement';
+import {
+  enqueueBatchedPhotoWrite,
+  notifyCameraActivity,
+  notifyShutterPressed,
+  setCapturesInFlight,
+} from './backgroundCameraQueue';
+import {
+  getEffectiveCameraPowerProfile,
+  incrementSessionCaptureCount,
+  markCameraSessionStarted,
+  markCameraSessionStopped,
+} from '../power/batterySaver';
+import {
+  AdaptivePreviewState,
+  createAdaptivePreviewState,
+  getTargetPreviewDims,
+  resolvePreviewResolutionSetting,
+  stepAdaptivePreviewState,
+} from './cameraPerf';
 
-async function persistCapturedShotToLog(params: {
-  shot: { dataUrl: string; width: number; height: number };
+function enqueueCapturedShotToBatchLog(params: {
+  shot: {
+    dataUrl: string;
+    thumbnailDataUrl?: string;
+    width: number;
+    height: number;
+    byteLength?: number;
+  };
+  photoMeta?: {
+    id: string;
+    sessionId: string;
+    timestamp: number;
+    dateKey: string;
+    enhancementStatus?: 'pending';
+  };
   sessionId: string;
-  onSaved?: (record: ShelfPhoto) => void;
-}): Promise<void> {
-  const now = Date.now();
+  onEnqueued?: (record: ShelfPhoto) => void;
+  onFlushed?: (record: ShelfPhoto, savingMs: number) => void;
+}): ShelfPhoto {
+  const now = params.photoMeta?.timestamp ?? Date.now();
   const record: ShelfPhoto = {
-    id: `ph_${now}_${Math.random().toString(36).slice(2, 7)}`,
-    sessionId: params.sessionId,
+    id:
+      params.photoMeta?.id ??
+      `ph_${now}_${Math.random().toString(36).slice(2, 7)}`,
+    sessionId: params.photoMeta?.sessionId ?? params.sessionId,
     timestamp: now,
-    dateKey: getLocalDateKey(now),
+    dateKey: params.photoMeta?.dateKey ?? getLocalDateKey(now),
     dataUrl: params.shot.dataUrl,
+    ...(params.shot.thumbnailDataUrl
+      ? { thumbnailDataUrl: params.shot.thumbnailDataUrl }
+      : {}),
     width: params.shot.width,
     height: params.shot.height,
+    ...(params.photoMeta?.enhancementStatus
+      ? { enhancementStatus: params.photoMeta.enhancementStatus }
+      : {}),
   };
-  await savePhoto(record);
-  params.onSaved?.(record);
+  params.onEnqueued?.(record);
+  void enqueueBatchedPhotoWrite(record, (savingMs) => {
+    params.onFlushed?.(record, savingMs);
+  });
+  return record;
 }
 
 interface PendingReviewShot {
   dataUrl: string;
+  thumbnailDataUrl?: string;
   width: number;
   height: number;
+  byteLength?: number;
   isBlurry: boolean;
   variance: number;
+  captureMethod?: CameraCaptureMethod;
+  captureMs?: number;
+  processingMs?: number;
 }
 
 interface CameraScreenProps {
   sessionId: string;
   settings: AppSettings;
   isOnline: boolean;
+  isBatterySaverOn?: boolean;
   onPhotoQueued: () => void;
   onOpenPhotoInLog?: (photoId: string) => void;
   onUpdateSettings?: (partial: Partial<AppSettings>) => Promise<void>;
 }
 
 const FLASH_CYCLE: FlashMode[] = ['auto', 'on', 'off'];
-const ZOOM_PRESETS = [1, 2, 3] as const;
 
 // Preserves the user's selected flash mode across internal app tab switches
 let rememberedFlashMode: FlashMode | null = null;
@@ -119,27 +187,61 @@ let noTorchNoticeShownOnce = false;
 export const CameraScreen: React.FC<CameraScreenProps> = ({
   sessionId,
   settings,
+  isBatterySaverOn = false,
   onPhotoQueued,
 }) => {
+  const effectivePowerProfile = getEffectiveCameraPowerProfile({
+    settings,
+    isBatterySaverOn: Boolean(isBatterySaverOn),
+  });
+  const effectiveFrameRate = effectivePowerProfile.frameRate;
+  const effectiveIdleTimeoutSec = effectivePowerProfile.idleTimeoutSec;
+
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const videoTrackRef = useRef<MediaStreamTrack | null>(null);
   const galleryInputRef = useRef<HTMLInputElement | null>(null);
+  const nativeCameraInputRef = useRef<HTMLInputElement | null>(null);
   const meterCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Direct DOM refs to avoid React re-renders during streaming, shutter flash, and pinch zoom
+  // Direct DOM refs to avoid React re-renders during streaming, freeze-frame overlay, and shutter flash
+  const freezeOverlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const freezeOverlayTimerRef = useRef<number | null>(null);
+  const freezeTokenRef = useRef(0);
   const flashOverlayRef = useRef<HTMLDivElement | null>(null);
   const zoomLabelRef = useRef<HTMLDivElement | null>(null);
-  const isCapturingRef = useRef(false);
+  const pendingBadgeRef = useRef<HTMLSpanElement | null>(null);
+  const savedCountRef = useRef<HTMLSpanElement | null>(null);
+  const savedPhotoCountValueRef = useRef(0);
+  const inFlightHardwareCaptureRef = useRef(false);
+  const captureQueueChainRef = useRef<Promise<void>>(Promise.resolve());
+  const pendingCountRef = useRef(0);
   const isMountedRef = useRef(true);
   const startRunIdRef = useRef(0);
-  const captureUnlockTimerRef = useRef<number | null>(null);
 
   const [cameraState, setCameraState] = useState<
-    'starting' | 'active' | 'denied' | 'unavailable'
+    'starting' | 'active' | 'idle' | 'denied' | 'unavailable'
   >('starting');
+  const cameraStateRef = useRef<
+    'starting' | 'active' | 'idle' | 'denied' | 'unavailable'
+  >('starting');
+  cameraStateRef.current = cameraState;
+
+  const effectiveFrameRateRef = useRef<number>(effectiveFrameRate);
+  effectiveFrameRateRef.current = effectiveFrameRate;
+  const effectiveIdleTimeoutSecRef = useRef<number>(effectiveIdleTimeoutSec);
+  effectiveIdleTimeoutSecRef.current = effectiveIdleTimeoutSec;
+  const idleStopTimerRef = useRef<number | null>(null);
+  const pausedByVisibilityRef = useRef(false);
+  const [savedPhotoCount, setSavedPhotoCount] = useState<number>(0);
   const [reviewShot, setReviewShot] = useState<PendingReviewShot | null>(null);
   const [showMoreMenu, setShowMoreMenu] = useState(false);
+  const [previewDowngradedNotice, setPreviewDowngradedNotice] = useState(false);
+  const adaptivePreviewStateRef = useRef<AdaptivePreviewState>(
+    createAdaptivePreviewState()
+  );
+  const previewDowngradedRef = useRef(false);
+  const measuredFpsRef = useRef<number | null>(null);
 
   const maxPhotoDimsRef = useRef<{ imageWidth?: number; imageHeight?: number }>(
     {}
@@ -176,7 +278,7 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
   const flashNoticeTimerRef = useRef<number | null>(null);
   const noTorchTimerRef = useRef<number | null>(null);
 
-  // Zoom state (range & active chip/overlay visibility) without re-rendering per pinch frame
+  // Zoom state (range & active chip/overlay updated directly on DOM during pinch gestures)
   const [hardwareZoomRange, setHardwareZoomRange] = useState<{
     min: number;
     max: number;
@@ -188,14 +290,8 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
     step: number;
   } | null>(null);
   const [activePresetZoom, setActivePresetZoom] = useState<number>(1);
-  const [showZoomOverlay, setShowZoomOverlay] = useState(false);
 
   const zoomValueRef = useRef<number>(1);
-  const zoomMin = hardwareZoomRange ? Math.min(1, hardwareZoomRange.min) : 1;
-  const zoomMax = Math.max(4, hardwareZoomRange ? hardwareZoomRange.max : 4);
-  const zoomStep = hardwareZoomRange ? hardwareZoomRange.step : 0.1;
-  const zoomBoundsRef = useRef({ min: 1, max: 4 });
-  zoomBoundsRef.current = { min: zoomMin, max: zoomMax };
 
   const pinchStartDistRef = useRef<number | null>(null);
   const pinchStartZoomRef = useRef<number>(1);
@@ -204,12 +300,50 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
   const pendingHwZoomRef = useRef<number | null>(null);
   const flashTimerRef = useRef<number | null>(null);
 
+  const syncPendingBadgeDom = useCallback((nextPending: number) => {
+    pendingCountRef.current = nextPending;
+    const badge = pendingBadgeRef.current;
+    if (!badge) return;
+    if (nextPending > 0) {
+      badge.textContent = `+${nextPending}`;
+      badge.style.display = 'inline-flex';
+    } else {
+      badge.textContent = '';
+      badge.style.display = 'none';
+    }
+  }, []);
+
+  const incrementSavedPhotoCounterDom = useCallback(() => {
+    savedPhotoCountValueRef.current += 1;
+    if (savedCountRef.current) {
+      savedCountRef.current.textContent = String(savedPhotoCountValueRef.current);
+    }
+  }, []);
+
   useEffect(() => {
     isMountedRef.current = true;
+    getAllPhotos()
+      .then((list) => {
+        if (isMountedRef.current) {
+          savedPhotoCountValueRef.current = list.length;
+          setSavedPhotoCount(list.length);
+          if (savedCountRef.current) {
+            savedCountRef.current.textContent = String(list.length);
+          }
+        }
+      })
+      .catch(() => {});
     return () => {
       isMountedRef.current = false;
+      setCapturesInFlight(0);
     };
   }, []);
+
+  useEffect(() => {
+    saveCameraDiagnostics({
+      lastCaptureMode: resolveCaptureMode(settings.captureMode),
+    });
+  }, [settings.captureMode]);
 
   const updateFlashModeState = useCallback((nextMode: FlashMode) => {
     flashModeRef.current = nextMode;
@@ -231,42 +365,93 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
     }
   }, [settings.autoFlash, flashMode, updateFlashModeState]);
 
-  const triggerShutterFeedback = useCallback((playSound: boolean) => {
-    if (playSound) {
-      playShutterSound();
-    }
-    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
-      try {
-        navigator.vibrate(28);
-      } catch {
-        // Ignore if blocked
+  const triggerShutterFeedback = useCallback(
+    (playSound: boolean, showFlashBar: boolean = true) => {
+      if (playSound) {
+        playShutterSound();
       }
-    }
-    const overlay = flashOverlayRef.current;
-    if (overlay) {
-      overlay.style.opacity = '1';
-      if (flashTimerRef.current !== null) {
-        window.clearTimeout(flashTimerRef.current);
-      }
-      flashTimerRef.current = window.setTimeout(() => {
-        if (flashOverlayRef.current) {
-          flashOverlayRef.current.style.opacity = '0';
+      if (
+        typeof navigator !== 'undefined' &&
+        typeof navigator.vibrate === 'function'
+      ) {
+        try {
+          navigator.vibrate(28);
+        } catch {
+          // Ignore if blocked
         }
-        flashTimerRef.current = null;
-      }, 120);
-    }
-  }, []);
+      }
+      if (!showFlashBar) return;
+      const overlay = flashOverlayRef.current;
+      if (overlay) {
+        overlay.style.opacity = '1';
+        if (flashTimerRef.current !== null) {
+          window.clearTimeout(flashTimerRef.current);
+        }
+        flashTimerRef.current = window.setTimeout(() => {
+          if (flashOverlayRef.current) {
+            flashOverlayRef.current.style.opacity = '0';
+          }
+          flashTimerRef.current = null;
+        }, 120);
+      }
+    },
+    []
+  );
 
   const triggerZoomOverlay = useCallback(() => {
-    setShowZoomOverlay(true);
+    if (zoomLabelRef.current) {
+      zoomLabelRef.current.style.opacity = '1';
+    }
     if (zoomFadeTimerRef.current !== null) {
       window.clearTimeout(zoomFadeTimerRef.current);
     }
     zoomFadeTimerRef.current = window.setTimeout(() => {
-      setShowZoomOverlay(false);
+      if (zoomLabelRef.current) {
+        zoomLabelRef.current.style.opacity = '0';
+      }
       zoomFadeTimerRef.current = null;
     }, 2000);
   }, []);
+
+  const hideFreezeOverlay = useCallback((token?: number) => {
+    if (token !== undefined && token !== freezeTokenRef.current) {
+      return;
+    }
+    if (freezeOverlayTimerRef.current !== null) {
+      window.clearTimeout(freezeOverlayTimerRef.current);
+      freezeOverlayTimerRef.current = null;
+    }
+    const fc = freezeOverlayCanvasRef.current;
+    if (fc) {
+      fc.style.opacity = '0';
+    }
+  }, []);
+
+  const showFreezeOverlay = useCallback(
+    (video: HTMLVideoElement): number => {
+      const token = ++freezeTokenRef.current;
+      const fc = freezeOverlayCanvasRef.current;
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+      if (fc && vw > 0 && vh > 0) {
+        if (fc.width !== vw) fc.width = vw;
+        if (fc.height !== vh) fc.height = vh;
+        const ctx = fc.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(video, 0, 0, vw, vh);
+          fc.style.opacity = '1';
+        }
+      }
+      if (freezeOverlayTimerRef.current !== null) {
+        window.clearTimeout(freezeOverlayTimerRef.current);
+      }
+      freezeOverlayTimerRef.current = window.setTimeout(() => {
+        hideFreezeOverlay(token);
+      }, FREEZE_OVERLAY_MAX_MS);
+      return token;
+    },
+    [hideFreezeOverlay]
+  );
 
   useEffect(() => {
     return () => {
@@ -279,8 +464,8 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
       if (flashTimerRef.current !== null) {
         window.clearTimeout(flashTimerRef.current);
       }
-      if (captureUnlockTimerRef.current !== null) {
-        window.clearTimeout(captureUnlockTimerRef.current);
+      if (freezeOverlayTimerRef.current !== null) {
+        window.clearTimeout(freezeOverlayTimerRef.current);
       }
       if (flashNoticeTimerRef.current !== null) {
         window.clearTimeout(flashNoticeTimerRef.current);
@@ -290,6 +475,9 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
       }
       if (noTorchTimerRef.current !== null) {
         window.clearTimeout(noTorchTimerRef.current);
+      }
+      if (idleStopTimerRef.current !== null) {
+        window.clearTimeout(idleStopTimerRef.current);
       }
     };
   }, []);
@@ -424,15 +612,9 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
 
   const syncZoomToDom = useCallback(
     (rounded: number, commitPresetState: boolean) => {
-      const hw = hardwareZoomRangeRef.current;
-      const hwApplied = hw ? Math.max(hw.min, Math.min(hw.max, rounded)) : 1;
-      const digitalScale = hw
-        ? Math.max(1, rounded / Math.max(1, hwApplied))
-        : rounded;
-
-      if (videoRef.current) {
-        videoRef.current.style.transform =
-          digitalScale > 1.01 ? `scale(${digitalScale})` : '';
+      // Never scale the preview with CSS or apply filters to <video>
+      if (videoRef.current && videoRef.current.style.transform) {
+        videoRef.current.style.transform = '';
       }
       if (zoomLabelRef.current) {
         zoomLabelRef.current.textContent = `${rounded.toFixed(1)}x`;
@@ -447,9 +629,13 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
 
   const applyZoom = useCallback(
     (next: number, showOverlay: boolean = true, syncPreset: boolean = true) => {
-      const { min, max } = zoomBoundsRef.current;
-      const clamped = Math.max(min, Math.min(max, next));
-      const rounded = Math.round(clamped * 10) / 10;
+      const hw = hardwareZoomRangeRef.current;
+      if (!hw || hw.max <= hw.min) {
+        zoomValueRef.current = 1;
+        syncZoomToDom(1, true);
+        return;
+      }
+      const rounded = clampHardwareZoom(next, hw);
       if (Math.abs(rounded - zoomValueRef.current) >= 0.05) {
         lastZoomChangedAtRef.current = Date.now();
       }
@@ -460,22 +646,18 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
       }
 
       const track = videoTrackRef.current;
-      const hw = hardwareZoomRangeRef.current;
-      if (hw) {
-        const hwTarget = Math.max(hw.min, Math.min(hw.max, rounded));
-        constraintStateRef.current = {
-          ...constraintStateRef.current,
-          zoom: hwTarget,
-        };
-        pendingHwZoomRef.current = hwTarget;
-        if (track && zoomRafRef.current === null) {
-          zoomRafRef.current = requestAnimationFrame(() => {
-            zoomRafRef.current = null;
-            if (pendingHwZoomRef.current !== null && videoTrackRef.current) {
-              void syncUnifiedTrackConstraints({ showMismatchOnce: false });
-            }
-          });
-        }
+      constraintStateRef.current = {
+        ...constraintStateRef.current,
+        zoom: rounded,
+      };
+      pendingHwZoomRef.current = rounded;
+      if (track && zoomRafRef.current === null) {
+        zoomRafRef.current = requestAnimationFrame(() => {
+          zoomRafRef.current = null;
+          if (pendingHwZoomRef.current !== null && videoTrackRef.current) {
+            void syncUnifiedTrackConstraints({ showMismatchOnce: false });
+          }
+        });
       }
     },
     [syncZoomToDom, triggerZoomOverlay, syncUnifiedTrackConstraints]
@@ -484,17 +666,32 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
   useEffect(() => {
     if (!settings.zoomControls) {
       applyZoom(1, false, true);
-      setShowZoomOverlay(false);
+      if (zoomLabelRef.current) {
+        zoomLabelRef.current.style.opacity = '0';
+      }
     }
   }, [settings.zoomControls, applyZoom]);
 
+  const clearIdleStopTimer = useCallback(() => {
+    if (idleStopTimerRef.current !== null) {
+      window.clearTimeout(idleStopTimerRef.current);
+      idleStopTimerRef.current = null;
+    }
+  }, []);
+
   const stopCamera = useCallback(() => {
+    clearIdleStopTimer();
+    markCameraSessionStopped();
     if (postPlayTimerRef.current !== null) {
       window.clearTimeout(postPlayTimerRef.current);
       postPlayTimerRef.current = null;
     }
     postPlayReadyRef.current = false;
 
+    constraintStateRef.current = {
+      ...constraintStateRef.current,
+      torch: false,
+    };
     if (torchOnRef.current && videoTrackRef.current) {
       const offConstraints = buildUnifiedAdvancedConstraints(
         { ...constraintStateRef.current, torch: false },
@@ -521,7 +718,41 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
-  }, []);
+  }, [clearIdleStopTimer]);
+
+  const scheduleIdleStopTimer = useCallback(() => {
+    clearIdleStopTimer();
+    const timeoutSec = effectiveIdleTimeoutSecRef.current;
+    if (
+      !isMountedRef.current ||
+      cameraStateRef.current !== 'active' ||
+      timeoutSec <= 0 ||
+      document.visibilityState !== 'visible'
+    ) {
+      return;
+    }
+    idleStopTimerRef.current = window.setTimeout(() => {
+      idleStopTimerRef.current = null;
+      if (!isMountedRef.current || cameraStateRef.current !== 'active') {
+        return;
+      }
+      if (pendingCountRef.current > 0 || inFlightHardwareCaptureRef.current) {
+        scheduleIdleStopTimer();
+        return;
+      }
+      pausedByVisibilityRef.current = false;
+      startRunIdRef.current++;
+      stopCamera();
+      setCameraState('idle');
+    }, timeoutSec * 1000);
+  }, [clearIdleStopTimer, stopCamera]);
+
+  const recordUserActivity = useCallback(() => {
+    notifyCameraActivity();
+    if (cameraStateRef.current === 'active') {
+      scheduleIdleStopTimer();
+    }
+  }, [scheduleIdleStopTimer]);
 
   /**
    * Reads capabilities ONLY without sending any separate applyConstraints call.
@@ -694,16 +925,16 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
     }
     if (!meterCanvasRef.current) {
       const c = document.createElement('canvas');
-      c.width = 16;
-      c.height = 16;
+      c.width = 32;
+      c.height = 24;
       meterCanvasRef.current = c;
     }
     const ctx = meterCanvasRef.current.getContext('2d', {
       willReadFrequently: true,
     });
     if (!ctx) return null;
-    ctx.drawImage(video, 0, 0, 16, 16);
-    const pixels = ctx.getImageData(0, 0, 16, 16).data;
+    ctx.drawImage(video, 0, 0, 32, 24);
+    const pixels = ctx.getImageData(0, 0, 32, 24).data;
     return computeBrightnessMetricsFromRgba(pixels);
   }, []);
 
@@ -789,7 +1020,11 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
   }, []);
 
   const startCamera = useCallback(
-    async (options?: { silentBackground?: boolean }) => {
+    async (options?: {
+      silentBackground?: boolean;
+      overrideResolution?: '720p' | '1080p';
+      lockedDeviceId?: string | null;
+    }) => {
       const silent = Boolean(options?.silentBackground);
       const runId = ++startRunIdRef.current;
       const isStale = () =>
@@ -804,15 +1039,42 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
         return;
       }
 
+      if (document.visibilityState === 'hidden') {
+        pausedByVisibilityRef.current = true;
+        stopCamera();
+        return;
+      }
+
       if (!silent) {
         setCameraState('starting');
+        previewDowngradedRef.current = false;
+        adaptivePreviewStateRef.current = createAdaptivePreviewState();
+        setPreviewDowngradedNotice(false);
       }
       torchMismatchNoticeShownRef.current = false;
       setFlashUnavailableNotice(false);
       stopCamera();
 
+      const resolvedPreviewRes =
+        options?.overrideResolution ||
+        (previewDowngradedRef.current
+          ? '720p'
+          : resolvePreviewResolutionSetting(
+              settings.previewResolution,
+              settings.cameraHighQuality
+            ));
+      const requestedFps = effectiveFrameRateRef.current;
+      const targetDims = getTargetPreviewDims(resolvedPreviewRes, requestedFps);
+      saveCameraDiagnostics({
+        requestedPreviewWidth: targetDims.width,
+        requestedPreviewHeight: targetDims.height,
+        requestedFrameRate: targetDims.frameRate,
+        previewDowngraded: previewDowngradedRef.current,
+      });
+
       const diagBefore = readCameraDiagnostics();
       const manualDeviceId =
+        options?.lockedDeviceId?.trim() ||
         settings.selectedCameraDeviceId?.trim() ||
         diagBefore.selectedCameraDeviceId?.trim() ||
         null;
@@ -824,7 +1086,8 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
         let stream: MediaStream;
         try {
           stream = await startCameraWithRetryLadder({
-            highQuality: settings.cameraHighQuality !== false,
+            previewResolution: resolvedPreviewRes,
+            frameRate: requestedFps,
             targetDeviceId: lockedInitialDeviceId,
             getUserMedia: (constraints) =>
               navigator.mediaDevices.getUserMedia(constraints),
@@ -843,7 +1106,8 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
             ...(!manualDeviceId ? { rememberedTorchDeviceId: null } : {}),
           });
           stream = await startCameraWithRetryLadder({
-            highQuality: settings.cameraHighQuality !== false,
+            previewResolution: resolvedPreviewRes,
+            frameRate: requestedFps,
             targetDeviceId: null,
             getUserMedia: (constraints) =>
               navigator.mediaDevices.getUserMedia(constraints),
@@ -977,7 +1241,8 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
                 if (winner && winner.deviceId !== initDeviceId) {
                   stopStreamTracks(activeStream);
                   activeStream = await startCameraWithRetryLadder({
-                    highQuality: settings.cameraHighQuality !== false,
+                    previewResolution: resolvedPreviewRes,
+                    frameRate: requestedFps,
                     targetDeviceId: winner.deviceId,
                     getUserMedia: (constraints) =>
                       navigator.mediaDevices.getUserMedia(constraints),
@@ -1083,7 +1348,8 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
                     stopStreamTracks(activeStream);
                   }
                   activeStream = await startCameraWithRetryLadder({
-                    highQuality: settings.cameraHighQuality !== false,
+                    previewResolution: resolvedPreviewRes,
+                    frameRate: requestedFps,
                     targetDeviceId: chosenDeviceId,
                     getUserMedia: (constraints) =>
                       navigator.mediaDevices.getUserMedia(constraints),
@@ -1150,11 +1416,22 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
           }
         }
 
-        if (isStale()) {
+        const isDocHiddenNow = () =>
+          typeof document !== 'undefined' &&
+          document.visibilityState === 'hidden';
+
+        if (isStale() || isDocHiddenNow()) {
+          pausedByVisibilityRef.current = isDocHiddenNow();
+          stopStreamTracks(activeStream);
           return;
         }
 
         const activeTrackTorch = await inspectTrackCapabilities(track);
+        if (isStale() || isDocHiddenNow()) {
+          pausedByVisibilityRef.current = isDocHiddenNow();
+          stopStreamTracks(activeStream);
+          return;
+        }
         if (!activeTrackTorch && finalNoTorchFound) {
           noTorchAvailableRef.current = true;
           setNoTorchAvailable(true);
@@ -1164,6 +1441,10 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
         }
 
         setCameraState('active');
+        cameraStateRef.current = 'active';
+        markCameraSessionStarted();
+        notifyCameraActivity();
+        scheduleIdleStopTimer();
 
         if (track) {
           schedulePostPlayConstraintRestore(track, runId);
@@ -1184,8 +1465,10 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
       inspectTrackCapabilities,
       waitForVideoPlaying,
       schedulePostPlayConstraintRestore,
+      scheduleIdleStopTimer,
       showNoTorchNoticeOnce,
       settings.cameraHighQuality,
+      settings.previewResolution,
       settings.selectedCameraDeviceId,
     ]
   );
@@ -1195,9 +1478,16 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
 
     const restoreOnTabReturn = async () => {
       if (!isMountedRef.current) return;
+      if (cameraStateRef.current === 'idle' && !pausedByVisibilityRef.current) {
+        return;
+      }
       const track = videoTrackRef.current;
       if (!track || track.readyState !== 'live') {
-        startCamera({ silentBackground: false });
+        pausedByVisibilityRef.current = false;
+        void startCamera({
+          silentBackground: false,
+          lockedDeviceId: activeDeviceIdRef.current,
+        });
         return;
       }
       const runId = startRunIdRef.current;
@@ -1220,18 +1510,44 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
         track.readyState === 'live'
       ) {
         schedulePostPlayConstraintRestore(track, runId);
+        scheduleIdleStopTimer();
       }
     };
 
     const handleVisibility = () => {
-      if (document.visibilityState === 'visible') {
-        void restoreOnTabReturn();
+      if (document.visibilityState === 'hidden') {
+        if (
+          cameraStateRef.current === 'active' ||
+          cameraStateRef.current === 'starting'
+        ) {
+          pausedByVisibilityRef.current = true;
+        }
+        startRunIdRef.current++;
+        stopCamera();
+      } else if (document.visibilityState === 'visible') {
+        if (pausedByVisibilityRef.current) {
+          pausedByVisibilityRef.current = false;
+          void startCamera({
+            silentBackground: false,
+            lockedDeviceId: activeDeviceIdRef.current,
+          });
+        } else if (cameraStateRef.current === 'active') {
+          void restoreOnTabReturn();
+        }
       }
     };
 
     const handleFocus = () => {
       if (document.visibilityState === 'visible') {
-        void restoreOnTabReturn();
+        if (pausedByVisibilityRef.current) {
+          pausedByVisibilityRef.current = false;
+          void startCamera({
+            silentBackground: false,
+            lockedDeviceId: activeDeviceIdRef.current,
+          });
+        } else if (cameraStateRef.current === 'active') {
+          void restoreOnTabReturn();
+        }
       }
     };
 
@@ -1240,7 +1556,7 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
 
     let permStatus: PermissionStatus | null = null;
     const handlePermChange = () => {
-      if (permStatus?.state === 'granted') {
+      if (permStatus?.state === 'granted' && cameraStateRef.current !== 'idle') {
         startCamera({ silentBackground: false });
       }
     };
@@ -1269,7 +1585,44 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
     stopCamera,
     waitForVideoPlaying,
     schedulePostPlayConstraintRestore,
+    scheduleIdleStopTimer,
   ]);
+
+  // Keep idle-stop timer synchronized with active state & configured/effective timeout
+  useEffect(() => {
+    if (cameraState === 'active' && effectiveIdleTimeoutSec > 0) {
+      scheduleIdleStopTimer();
+    } else {
+      clearIdleStopTimer();
+    }
+    return () => {
+      clearIdleStopTimer();
+    };
+  }, [
+    cameraState,
+    effectiveIdleTimeoutSec,
+    scheduleIdleStopTimer,
+    clearIdleStopTimer,
+  ]);
+
+  // Apply updated frame rate constraint smoothly without restarting the camera when FPS setting / Battery Saver toggles
+  useEffect(() => {
+    if (cameraState !== 'active') return;
+    saveCameraDiagnostics({ requestedFrameRate: effectiveFrameRate });
+    const track = videoTrackRef.current;
+    if (!track || track.readyState !== 'live' || typeof track.applyConstraints !== 'function') {
+      return;
+    }
+    track
+      .applyConstraints({
+        frameRate: { ideal: effectiveFrameRate, max: effectiveFrameRate },
+      })
+      .catch(() =>
+        track
+          .applyConstraints({ frameRate: { ideal: effectiveFrameRate } })
+          .catch(() => {})
+      );
+  }, [cameraState, effectiveFrameRate]);
 
   // Quiet background retry every 5s while camera is unavailable/denied; auto-dismisses when recovered
   useEffect(() => {
@@ -1285,7 +1638,151 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
     };
   }, [cameraState, startCamera]);
 
-  // Smart Auto Flash: samples brightness every 300ms with hysteresis, using the same single-call path
+  // Adaptive preview FPS monitor (auto mode): downgrades 1080p -> 720p on same deviceId if FPS < 20 for 3s while idle
+  useEffect(() => {
+    const mode = resolvePreviewResolutionSetting(
+      settings.previewResolution,
+      settings.cameraHighQuality
+    );
+    if (cameraState !== 'active' || mode !== 'auto' || previewDowngradedRef.current) {
+      return;
+    }
+    const video = videoRef.current;
+    if (!video) return;
+
+    let cancelled = false;
+    let rvfcId: number | null = null;
+    const frameTimes: number[] = [];
+    const rVfc = (
+      video as HTMLVideoElement & {
+        requestVideoFrameCallback?: (cb: (now: number) => void) => number;
+        cancelVideoFrameCallback?: (id: number) => void;
+      }
+    ).requestVideoFrameCallback;
+
+    if (typeof rVfc === 'function') {
+      const onFrame = (now: number) => {
+        if (cancelled) return;
+        if (document.visibilityState === 'visible') {
+          frameTimes.push(now);
+          while (frameTimes.length > 0 && now - frameTimes[0] > 1500) {
+            frameTimes.shift();
+          }
+          if (frameTimes.length >= 2) {
+            const spanMs = frameTimes[frameTimes.length - 1] - frameTimes[0];
+            if (spanMs > 300) {
+              measuredFpsRef.current = ((frameTimes.length - 1) * 1000) / spanMs;
+            }
+          }
+        }
+        rvfcId = rVfc.call(video, onFrame);
+      };
+      rvfcId = rVfc.call(video, onFrame);
+    }
+
+    const triggerAdaptiveDowngrade = async () => {
+      if (
+        cancelled ||
+        previewDowngradedRef.current ||
+        pendingCountRef.current > 0 ||
+        inFlightHardwareCaptureRef.current
+      ) {
+        return;
+      }
+      const track = videoTrackRef.current;
+      const keepDeviceId = activeDeviceIdRef.current;
+      const targetFps = effectiveFrameRateRef.current;
+      previewDowngradedRef.current = true;
+      setPreviewDowngradedNotice(true);
+      saveCameraDiagnostics({
+        previewDowngraded: true,
+        requestedPreviewWidth: 1280,
+        requestedPreviewHeight: 720,
+        requestedFrameRate: targetFps,
+      });
+
+      if (track && track.readyState === 'live') {
+        try {
+          await track.applyConstraints({
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            frameRate: { ideal: targetFps, max: targetFps },
+          });
+          await new Promise<void>((r) => window.setTimeout(r, 350));
+          if (cancelled || pendingCountRef.current > 0 || inFlightHardwareCaptureRef.current) {
+            return;
+          }
+          if (video.videoWidth > 0 && video.videoWidth <= 1280) {
+            saveCameraDiagnostics({
+              previewWidth: video.videoWidth,
+              previewHeight: video.videoHeight,
+            });
+            return;
+          }
+        } catch {
+          // Fallback to same-device stream restart below
+        }
+      }
+
+      if (
+        !cancelled &&
+        pendingCountRef.current === 0 &&
+        !inFlightHardwareCaptureRef.current
+      ) {
+        void startCamera({
+          silentBackground: true,
+          overrideResolution: '720p',
+          lockedDeviceId: keepDeviceId,
+        });
+      }
+    };
+
+    const intervalId = window.setInterval(() => {
+      if (cancelled || document.visibilityState !== 'visible') {
+        adaptivePreviewStateRef.current = createAdaptivePreviewState();
+        frameTimes.length = 0;
+        measuredFpsRef.current = null;
+        return;
+      }
+      const step = stepAdaptivePreviewState(adaptivePreviewStateRef.current, {
+        mode,
+        targetFps: effectiveFrameRate,
+        currentFps: measuredFpsRef.current,
+        nowMs: performance.now(),
+        isCapturing:
+          pendingCountRef.current > 0 || inFlightHardwareCaptureRef.current,
+      });
+      adaptivePreviewStateRef.current = step.nextState;
+      if (step.shouldDowngrade) {
+        void triggerAdaptiveDowngrade();
+      }
+    }, 500);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+      const cancelRvfc = (
+        video as HTMLVideoElement & {
+          cancelVideoFrameCallback?: (id: number) => void;
+        }
+      ).cancelVideoFrameCallback;
+      if (rvfcId !== null && typeof cancelRvfc === 'function') {
+        try {
+          cancelRvfc.call(video, rvfcId);
+        } catch {
+          // Ignore
+        }
+      }
+    };
+  }, [
+    cameraState,
+    settings.previewResolution,
+    settings.cameraHighQuality,
+    effectiveFrameRate,
+    startCamera,
+  ]);
+
+  // Smart Auto Flash: samples brightness at most 2x/sec (500ms) on 32x24 canvas; paused when manual or page hidden
   useEffect(() => {
     if (
       cameraState !== 'active' ||
@@ -1300,7 +1797,15 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
     autoFlashStateRef.current = createInitialAutoFlashState(torchOnRef.current);
 
     const evaluateBrightness = () => {
-      if (isCapturingRef.current || !postPlayReadyRef.current) return;
+      if (
+        document.hidden ||
+        document.visibilityState === 'hidden' ||
+        flashModeRef.current !== 'auto' ||
+        inFlightHardwareCaptureRef.current ||
+        !postPlayReadyRef.current
+      ) {
+        return;
+      }
       const metrics = sampleVideoBrightnessMetrics();
       if (!metrics) return;
 
@@ -1344,402 +1849,654 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
     syncUnifiedTrackConstraints,
   ]);
 
+  const shouldEnhanceCaptureMethod = useCallback(
+    (captureMethod?: CameraCaptureMethod) => {
+      const level = resolveEnhanceLevel(settings.photoEnhanceLevel);
+      if (!level) return null;
+      if (captureMethod === 'gallery' && !settings.enhanceGalleryImports) {
+        return null;
+      }
+      return level;
+    },
+    [settings.photoEnhanceLevel, settings.enhanceGalleryImports]
+  );
+
   const commitPhotoToDB = useCallback(
     async (
-      shot: { dataUrl: string; width: number; height: number },
-      _unused?: string,
-      captureMethod?: 'takePhoto' | 'videoFrame' | 'gallery'
+      shot: {
+        dataUrl: string;
+        thumbnailDataUrl?: string;
+        width: number;
+        height: number;
+        byteLength?: number;
+      },
+      photoMeta?: {
+        id: string;
+        sessionId: string;
+        timestamp: number;
+        dateKey: string;
+        enhancementStatus?: 'pending';
+      },
+      captureMethod?: CameraCaptureMethod,
+      timings?: { captureMs?: number; processingMs?: number; captureMode?: 'high-quality' | 'fast' }
     ) => {
-      await persistCapturedShotToLog({
-        shot,
-        sessionId,
-        onSaved: (record) => {
-          if (captureMethod && record.width > 0 && record.height > 0) {
-            saveCameraDiagnostics({
-              lastSavedPhotoWidth: record.width,
-              lastSavedPhotoHeight: record.height,
-              lastSavedPhotoMethod: captureMethod,
-            });
+      const enhanceLevel = shouldEnhanceCaptureMethod(captureMethod);
+      const effectiveMeta = photoMeta
+        ? {
+            ...photoMeta,
+            ...(enhanceLevel ? { enhancementStatus: 'pending' as const } : {}),
           }
+        : enhanceLevel
+        ? {
+            id: `ph_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+            sessionId,
+            timestamp: Date.now(),
+            dateKey: getLocalDateKey(Date.now()),
+            enhancementStatus: 'pending' as const,
+          }
+        : undefined;
+
+      const saved = enqueueCapturedShotToBatchLog({
+        shot,
+        photoMeta: effectiveMeta,
+        sessionId,
+        onEnqueued: (record) => {
+          const byteSize =
+            shot.byteLength ?? estimateDataUrlBytes(record.dataUrl);
+          saveCameraDiagnostics({
+            ...(timings?.captureMode ? { lastCaptureMode: timings.captureMode } : {}),
+            lastCaptureTimestamp: record.timestamp,
+            ...(typeof timings?.captureMs === 'number'
+              ? { lastCaptureMs: timings.captureMs }
+              : {}),
+            ...(typeof timings?.processingMs === 'number'
+              ? { lastProcessingMs: timings.processingMs }
+              : {}),
+            ...(record.width > 0 && record.height > 0
+              ? {
+                  lastSavedPhotoWidth: record.width,
+                  lastSavedPhotoHeight: record.height,
+                }
+              : {}),
+            ...(byteSize > 0 ? { lastSavedPhotoBytes: byteSize } : {}),
+            ...(captureMethod ? { lastSavedPhotoMethod: captureMethod } : {}),
+          });
           if (isMountedRef.current) {
+            incrementSavedPhotoCounterDom();
             onPhotoQueued();
           }
         },
+        onFlushed: (_record, savingMs) => {
+          saveCameraDiagnostics({ lastSavingMs: savingMs });
+        },
       });
+
+      if (enhanceLevel) {
+        enqueuePhotoEnhancement({
+          photoId: saved.id,
+          sourceDataUrl: shot.dataUrl,
+          level: enhanceLevel,
+          keepOriginal: Boolean(settings.keepOriginalPhoto),
+        });
+      }
     },
-    [sessionId, onPhotoQueued]
+    [
+      incrementSavedPhotoCounterDom,
+      onPhotoQueued,
+      sessionId,
+      settings.keepOriginalPhoto,
+      shouldEnhanceCaptureMethod,
+    ]
   );
 
   const finalizeProcessedShot = useCallback(
     async (processed: {
       dataUrl: string;
+      thumbnailDataUrl?: string;
       width: number;
       height: number;
+      byteLength?: number;
+      processingMs?: number;
+      savingMs?: number;
+      savedInWorker?: boolean;
+      photoId?: string;
+      photoTimestamp?: number;
       isBlurry: boolean;
       variance: number;
-      captureMethod?: 'takePhoto' | 'videoFrame' | 'gallery';
+      captureMethod?: CameraCaptureMethod;
+      captureMs?: number;
+      captureMode?: 'high-quality' | 'fast';
     }) => {
+      if (processed.savedInWorker) {
+        saveCameraDiagnostics({
+          ...(processed.captureMode
+            ? { lastCaptureMode: processed.captureMode }
+            : {}),
+          lastCaptureTimestamp: processed.photoTimestamp ?? Date.now(),
+          ...(typeof processed.captureMs === 'number'
+            ? { lastCaptureMs: processed.captureMs }
+            : {}),
+          ...(typeof processed.processingMs === 'number'
+            ? { lastProcessingMs: processed.processingMs }
+            : {}),
+          ...(typeof processed.savingMs === 'number'
+            ? { lastSavingMs: processed.savingMs }
+            : {}),
+          ...(processed.width > 0 && processed.height > 0
+            ? {
+                lastSavedPhotoWidth: processed.width,
+                lastSavedPhotoHeight: processed.height,
+              }
+            : {}),
+          ...(typeof processed.byteLength === 'number' &&
+          processed.byteLength > 0
+            ? { lastSavedPhotoBytes: processed.byteLength }
+            : {}),
+          ...(processed.captureMethod
+            ? { lastSavedPhotoMethod: processed.captureMethod }
+            : {}),
+        });
+        if (isMountedRef.current) {
+          incrementSavedPhotoCounterDom();
+          onPhotoQueued();
+        }
+        const enhanceLevel = shouldEnhanceCaptureMethod(processed.captureMethod);
+        if (enhanceLevel && processed.photoId) {
+          enqueuePhotoEnhancement({
+            photoId: processed.photoId,
+            level: enhanceLevel,
+            keepOriginal: Boolean(settings.keepOriginalPhoto),
+          });
+        }
+        return;
+      }
+
       if (settings.continuousMode !== false) {
         await commitPhotoToDB(
           {
             dataUrl: processed.dataUrl,
+            thumbnailDataUrl: processed.thumbnailDataUrl,
             width: processed.width,
             height: processed.height,
+            byteLength: processed.byteLength,
           },
-          undefined,
-          processed.captureMethod
+          processed.photoId
+            ? {
+                id: processed.photoId,
+                sessionId,
+                timestamp: processed.photoTimestamp ?? Date.now(),
+                dateKey: getLocalDateKey(processed.photoTimestamp ?? Date.now()),
+              }
+            : undefined,
+          processed.captureMethod,
+          {
+            captureMs: processed.captureMs,
+            processingMs: processed.processingMs,
+            captureMode: processed.captureMode,
+          }
         );
         return;
       }
 
       if (isMountedRef.current) {
-        setReviewShot(processed);
+        setReviewShot({
+          dataUrl: processed.dataUrl,
+          thumbnailDataUrl: processed.thumbnailDataUrl,
+          width: processed.width,
+          height: processed.height,
+          byteLength: processed.byteLength,
+          isBlurry: processed.isBlurry,
+          variance: processed.variance,
+          captureMethod: processed.captureMethod,
+          captureMs: processed.captureMs,
+          processingMs: processed.processingMs,
+        });
       } else if (!processed.isBlurry) {
         await commitPhotoToDB(
           {
             dataUrl: processed.dataUrl,
+            thumbnailDataUrl: processed.thumbnailDataUrl,
             width: processed.width,
             height: processed.height,
+            byteLength: processed.byteLength,
           },
           undefined,
-          processed.captureMethod
+          processed.captureMethod,
+          {
+            captureMs: processed.captureMs,
+            processingMs: processed.processingMs,
+            captureMode: processed.captureMode,
+          }
         );
       }
     },
-    [commitPhotoToDB, settings.continuousMode]
+    [
+      commitPhotoToDB,
+      incrementSavedPhotoCounterDom,
+      onPhotoQueued,
+      sessionId,
+      settings.continuousMode,
+      settings.keepOriginalPhoto,
+      shouldEnhanceCaptureMethod,
+    ]
   );
 
-  const handleCapture = async () => {
-    if (isCapturingRef.current) return;
+  const handleCapture = () => {
+    if (pendingCountRef.current >= MAX_CAPTURE_QUEUE_PENDING) return;
     warmAudioContext();
 
     if (cameraState !== 'active' || !videoRef.current) {
       return;
     }
 
-    isCapturingRef.current = true;
-    const settleWaitMs = computeFocusSettleWaitMs(
-      lastZoomChangedAtRef.current,
-      Date.now()
-    );
-    if (settleWaitMs > 0) {
-      await new Promise<void>((resolve) =>
-        window.setTimeout(resolve, settleWaitMs)
-      );
-      if (!isMountedRef.current || !videoRef.current) {
-        isCapturingRef.current = false;
-        return;
-      }
-    }
-
     const video = videoRef.current;
     const vw = video.videoWidth;
     const vh = video.videoHeight;
     if (!vw || !vh) {
-      isCapturingRef.current = false;
       return;
     }
 
     const previewW = video.clientWidth || vw;
     const previewH = video.clientHeight || vh;
+    const activeCaptureMode = resolveCaptureMode(settings.captureMode);
+    const skipBlurReview = settings.continuousMode !== false;
+    const blurThreshold = skipBlurReview ? 0 : DEFAULT_BLUR_THRESHOLD;
+    const capturedSessionId = sessionId;
+    const pressTimestamp = Date.now();
 
-    triggerShutterFeedback(settings.shutterSound);
+    // Pause background workers/storage for 1.5s after each shutter press while camera is open
+    notifyShutterPressed(pressTimestamp);
+    recordUserActivity();
 
-    const hw = hardwareZoomRangeRef.current;
-    const curZoom = zoomValueRef.current;
-    const hwApplied = hw ? Math.max(hw.min, Math.min(hw.max, curZoom)) : 1;
-    const digitalScale = hw
-      ? Math.max(1, curZoom / Math.max(1, hwApplied))
-      : curZoom;
+    // 1) Freeze-frame overlay + white flash ONLY in 'high-quality' mode; 'fast' mode captures without any freeze
+    const freezeToken =
+      activeCaptureMode === 'high-quality'
+        ? showFreezeOverlay(video)
+        : freezeTokenRef.current;
+    triggerShutterFeedback(
+      settings.shutterSound,
+      activeCaptureMode === 'high-quality'
+    );
+
+    // 2) Grab instant fallback ImageBitmap from current video frame before any async wait
+    const instantVideoBitmapPromise: Promise<ImageBitmap | undefined> =
+      typeof createImageBitmap === 'function'
+        ? createImageBitmap(video).catch(() => undefined)
+        : Promise.resolve(undefined);
 
     const drawFullResVideoCanvas = (): HTMLCanvasElement | null => {
       if (!video || !video.videoWidth || !video.videoHeight) return null;
       const w = video.videoWidth;
       const h = video.videoHeight;
       const rot = getVideoCaptureRotationDeg(w, h, previewW, previewH);
-      const scale = digitalScale > 1.01 ? digitalScale : 1;
-      const sw = w / scale;
-      const sh = h / scale;
-      const sx = (w - sw) / 2;
-      const sy = (h - sh) / 2;
       const quarterTurn = rot === 90 || rot === 270;
-      const outW = Math.round(quarterTurn ? sh : sw);
-      const outH = Math.round(quarterTurn ? sw : sh);
+      const outW = Math.round(quarterTurn ? h : w);
+      const outH = Math.round(quarterTurn ? w : h);
 
       const c = document.createElement('canvas');
       c.width = outW;
       c.height = outH;
       const ctx = c.getContext('2d');
       if (!ctx) return null;
-      drawCroppedRotatedToCanvas(ctx, video, sx, sy, sw, sh, outW, outH, rot);
+      drawCroppedRotatedToCanvas(ctx, video, 0, 0, w, h, outW, outH, rot);
       return c;
     };
 
-    // Use ImageCapture.takePhoto() at max supported sensor resolution when available
-    let takePhotoBlob: Blob | null = null;
-    if (videoTrackRef.current) {
-      const WinImageCapture = (
-        window as unknown as {
-          ImageCapture?: new (track: MediaStreamTrack) => {
-            takePhoto?: (settings?: Record<string, unknown>) => Promise<Blob>;
-          };
+    // 3) Enqueue immediately (up to 5 pending) with direct DOM badge update (zero React re-render on shutter)
+    syncPendingBadgeDom(pendingCountRef.current + 1);
+    incrementSessionCaptureCount();
+
+    const runQueuedJob = async () => {
+      let instantBitmap: ImageBitmap | undefined;
+      let captureStageMarked = false;
+      try {
+        const captureStart = performance.now();
+        setCapturesInFlight(1);
+        captureStageMarked = true;
+
+        // Only wait if zoom just changed within the last 300ms
+        const settleWaitMs = computeFocusSettleWaitMs(
+          lastZoomChangedAtRef.current,
+          Date.now()
+        );
+        if (settleWaitMs > 0) {
+          await new Promise<void>((resolve) =>
+            window.setTimeout(resolve, settleWaitMs)
+          );
         }
-      ).ImageCapture;
 
-      if (typeof WinImageCapture === 'function') {
-        try {
-          const ic = new WinImageCapture(videoTrackRef.current);
-          if (typeof ic.takePhoto === 'function') {
-            const torchWasRequestedOn = Boolean(
-              constraintStateRef.current.torch ||
-                torchOnRef.current ||
-                flashModeRef.current === 'on'
-            );
-            const torchActiveOrSupported = Boolean(
-              torchSupported ||
-                trackCapabilitiesRef.current?.torch === true ||
-                torchWasRequestedOn
-            );
-
-            // Never pass a fillLightMode that conflicts with torch
-            let fillLightMode: 'flash' | undefined;
-            if (!torchActiveOrSupported && photoFlashSupported) {
-              let shouldFireFlash = flashModeRef.current === 'on';
-              if (
-                !shouldFireFlash &&
-                flashModeRef.current === 'auto' &&
-                settings.autoFlash
-              ) {
-                const metrics = sampleVideoBrightnessMetrics();
-                if (metrics) {
-                  shouldFireFlash =
-                    metrics.avgLuma < AUTO_FLASH_DEFAULTS.lowLumaThreshold;
-                }
-              }
-              if (shouldFireFlash) {
-                fillLightMode = 'flash';
-              }
+        let takePhotoBlob: Blob | null = null;
+        if (activeCaptureMode === 'high-quality' && videoTrackRef.current) {
+          const WinImageCapture = (
+            window as unknown as {
+              ImageCapture?: new (track: MediaStreamTrack) => {
+                takePhoto?: (settings?: Record<string, unknown>) => Promise<Blob>;
+              };
             }
+          ).ImageCapture;
 
-            const takeOptions = buildTakePhotoSettings({
-              fillLightMode,
-              torchActive: torchActiveOrSupported,
-              maxPhotoDims: maxPhotoDimsRef.current,
-            });
-            const tryTakePhoto = (opts?: Record<string, unknown>) =>
-              Promise.race([
-                opts ? ic.takePhoto!(opts) : ic.takePhoto!(),
-                new Promise<null>((resolve) =>
-                  window.setTimeout(
-                    () => resolve(null),
-                    CAMERA_TAKE_PHOTO_TIMEOUT_MS
-                  )
-                ),
-              ]);
-
+          if (typeof WinImageCapture === 'function') {
+            inFlightHardwareCaptureRef.current = true;
             try {
-              takePhotoBlob = await tryTakePhoto(takeOptions);
-            } catch {
-              if (takeOptions?.imageWidth) {
-                const fallbackOpts = buildTakePhotoSettings({
+              const ic = new WinImageCapture(videoTrackRef.current);
+              if (typeof ic.takePhoto === 'function') {
+                const torchWasRequestedOn = Boolean(
+                  constraintStateRef.current.torch ||
+                    torchOnRef.current ||
+                    flashModeRef.current === 'on'
+                );
+                const torchActiveOrSupported = Boolean(
+                  torchSupported ||
+                    trackCapabilitiesRef.current?.torch === true ||
+                    torchWasRequestedOn
+                );
+
+                // Never pass a fillLightMode that conflicts with torch
+                let fillLightMode: 'flash' | undefined;
+                if (!torchActiveOrSupported && photoFlashSupported) {
+                  let shouldFireFlash = flashModeRef.current === 'on';
+                  if (
+                    !shouldFireFlash &&
+                    flashModeRef.current === 'auto' &&
+                    settings.autoFlash
+                  ) {
+                    const metrics = sampleVideoBrightnessMetrics();
+                    if (metrics) {
+                      shouldFireFlash =
+                        metrics.avgLuma < AUTO_FLASH_DEFAULTS.lowLumaThreshold;
+                    }
+                  }
+                  if (shouldFireFlash) {
+                    fillLightMode = 'flash';
+                  }
+                }
+
+                const takeOptions = buildTakePhotoSettings({
                   fillLightMode,
                   torchActive: torchActiveOrSupported,
+                  maxPhotoDims: maxPhotoDimsRef.current,
                 });
-                takePhotoBlob = await tryTakePhoto(fallbackOpts).catch(
-                  () => null
-                );
-              }
-            } finally {
-              // If takePhoto() reset torch on this device, restore full constraints right after the shot
-              if (
-                torchWasRequestedOn &&
-                videoTrackRef.current &&
-                videoTrackRef.current.readyState === 'live'
-              ) {
-                constraintStateRef.current = {
-                  ...constraintStateRef.current,
-                  torch: true,
+                const takePhotoDeadline =
+                  performance.now() + CAMERA_TAKE_PHOTO_TIMEOUT_MS;
+                const tryTakePhoto = (opts?: Record<string, unknown>) => {
+                  const remainingMs = Math.round(
+                    takePhotoDeadline - performance.now()
+                  );
+                  if (remainingMs <= 20) {
+                    return Promise.resolve(null);
+                  }
+                  return Promise.race([
+                    opts ? ic.takePhoto!(opts) : ic.takePhoto!(),
+                    new Promise<null>((resolve) =>
+                      window.setTimeout(() => resolve(null), remainingMs)
+                    ),
+                  ]);
                 };
-                await syncUnifiedTrackConstraints({ showMismatchOnce: false });
-                const verifySnap = readTrackSettingsSnapshot(
-                  videoTrackRef.current
-                );
-                if (
-                  verifySnap?.torch === false &&
-                  trackCapabilitiesRef.current?.torch === true
-                ) {
-                  window.setTimeout(() => {
-                    if (
-                      isMountedRef.current &&
-                      videoTrackRef.current?.readyState === 'live' &&
-                      constraintStateRef.current.torch
-                    ) {
-                      void syncUnifiedTrackConstraints({
-                        showMismatchOnce: false,
-                      });
-                    }
-                  }, 60);
+
+                try {
+                  takePhotoBlob = await tryTakePhoto(takeOptions);
+                } catch {
+                  if (takeOptions?.imageWidth) {
+                    const fallbackOpts = buildTakePhotoSettings({
+                      fillLightMode,
+                      torchActive: torchActiveOrSupported,
+                    });
+                    takePhotoBlob = await tryTakePhoto(fallbackOpts).catch(
+                      () => null
+                    );
+                  }
+                } finally {
+                  if (
+                    torchWasRequestedOn &&
+                    videoTrackRef.current &&
+                    videoTrackRef.current.readyState === 'live'
+                  ) {
+                    constraintStateRef.current = {
+                      ...constraintStateRef.current,
+                      torch: true,
+                    };
+                    await syncUnifiedTrackConstraints({
+                      showMismatchOnce: false,
+                    });
+                  }
                 }
               }
+            } catch {
+              takePhotoBlob = null;
+            } finally {
+              inFlightHardwareCaptureRef.current = false;
             }
           }
-        } catch {
-          takePhotoBlob = null;
         }
-      }
-    }
 
-    let capturedBitmap: ImageBitmap | undefined;
-    let fallbackCanvasData: HTMLCanvasElement | null = null;
-    let captureMethod: 'takePhoto' | 'videoFrame' = 'videoFrame';
-    try {
-      if (takePhotoBlob && typeof createImageBitmap === 'function') {
-        try {
-          capturedBitmap = await createImageBitmap(takePhotoBlob, {
-            imageOrientation: 'from-image',
-          });
-          captureMethod = 'takePhoto';
-        } catch {
-          capturedBitmap = undefined;
+        instantBitmap = await instantVideoBitmapPromise;
+
+        let capturedBitmap: ImageBitmap | undefined;
+        let fallbackCanvasData: HTMLCanvasElement | null = null;
+        let captureMethod: 'takePhoto' | 'videoFrame' = 'videoFrame';
+
+        if (takePhotoBlob && typeof createImageBitmap === 'function') {
+          try {
+            capturedBitmap = await createImageBitmap(takePhotoBlob, {
+              imageOrientation: 'from-image',
+            });
+            captureMethod = 'takePhoto';
+            if (instantBitmap) {
+              try {
+                instantBitmap.close();
+              } catch {
+                // Ignore
+              }
+              instantBitmap = undefined;
+            }
+          } catch {
+            capturedBitmap = undefined;
+          }
         }
-      }
-      if (!capturedBitmap && typeof createImageBitmap === 'function') {
-        try {
-          capturedBitmap = await createImageBitmap(video);
+
+        if (!capturedBitmap) {
+          if (instantBitmap) {
+            capturedBitmap = instantBitmap;
+            instantBitmap = undefined;
+            captureMethod = 'videoFrame';
+          } else if (
+            videoRef.current &&
+            videoRef.current.videoWidth > 0 &&
+            typeof createImageBitmap === 'function'
+          ) {
+            try {
+              capturedBitmap = await createImageBitmap(videoRef.current);
+              captureMethod = 'videoFrame';
+            } catch {
+              capturedBitmap = undefined;
+            }
+          }
+        }
+
+        if (!capturedBitmap) {
+          fallbackCanvasData = drawFullResVideoCanvas();
           captureMethod = 'videoFrame';
-        } catch {
-          capturedBitmap = undefined;
         }
-      }
-      if (!capturedBitmap) {
-        fallbackCanvasData = drawFullResVideoCanvas();
-        captureMethod = 'videoFrame';
-      }
-    } finally {
-      if (captureUnlockTimerRef.current !== null) {
-        window.clearTimeout(captureUnlockTimerRef.current);
-      }
-      captureUnlockTimerRef.current = window.setTimeout(() => {
-        isCapturingRef.current = false;
-        captureUnlockTimerRef.current = null;
-      }, 80);
-    }
 
-    const rotationDeg: 0 | 90 | 180 | 270 =
-      captureMethod === 'takePhoto'
-        ? 0
-        : capturedBitmap
-        ? getVideoCaptureRotationDeg(
-            capturedBitmap.width,
-            capturedBitmap.height,
-            previewW,
-            previewH
-          )
-        : 0;
+        const captureMs = Math.max(
+          1,
+          Math.round(performance.now() - captureStart)
+        );
+        setCapturesInFlight(0);
+        captureStageMarked = false;
 
-    const skipBlurReview = settings.continuousMode !== false;
-    const blurThreshold = skipBlurReview ? 0 : DEFAULT_BLUR_THRESHOLD;
-    const capturedSessionId = sessionId;
-    const photoMaxDim = settings.cameraHighQuality !== false ? 0 : 2048;
-    const photoQuality = 0.92;
+        // Remove freeze-frame overlay immediately once the photo is captured
+        if (activeCaptureMode === 'high-quality') {
+          hideFreezeOverlay(freezeToken);
+        }
 
-    if (capturedBitmap) {
-      processCaptureOffThread({
-        bitmap: capturedBitmap,
-        digitalScale,
-        rotationDeg,
-        maxDim: photoMaxDim,
-        quality: photoQuality,
-        blurThreshold,
-        fallbackCanvas: drawFullResVideoCanvas,
-        fallbackBlurCheck:
-          blurThreshold > 0
-            ? (c) => checkImageBlurFromCanvas(c, blurThreshold)
-            : undefined,
-      })
-        .then((processed) => {
-          if (skipBlurReview) {
-            return persistCapturedShotToLog({
-              shot: {
-                dataUrl: processed.dataUrl,
-                width: processed.width,
-                height: processed.height,
-              },
-              sessionId: capturedSessionId,
-              onSaved: (record) => {
-                if (record.width > 0 && record.height > 0) {
-                  saveCameraDiagnostics({
-                    lastSavedPhotoWidth: record.width,
-                    lastSavedPhotoHeight: record.height,
-                    lastSavedPhotoMethod: captureMethod,
-                  });
-                }
-                if (isMountedRef.current) {
-                  onPhotoQueued();
-                }
-              },
+        const rotationDeg: 0 | 90 | 180 | 270 =
+          captureMethod === 'takePhoto'
+            ? 0
+            : capturedBitmap
+            ? getVideoCaptureRotationDeg(
+                capturedBitmap.width,
+                capturedBitmap.height,
+                previewW,
+                previewH
+              )
+            : 0;
+
+        const shouldEnhanceThisShot = Boolean(
+          shouldEnhanceCaptureMethod(captureMethod)
+        );
+        const photoMeta = {
+          id: `ph_${pressTimestamp}_${Math.random().toString(36).slice(2, 7)}`,
+          sessionId: capturedSessionId,
+          timestamp: pressTimestamp,
+          dateKey: getLocalDateKey(pressTimestamp),
+          ...(shouldEnhanceThisShot ? { enhancementStatus: 'pending' as const } : {}),
+        };
+
+        if (capturedBitmap) {
+          try {
+            const processed = await processCaptureOffThread({
+              bitmap: capturedBitmap,
+              digitalScale: 1,
+              rotationDeg,
+              maxDim: MAX_SAVED_PHOTO_LONG_SIDE,
+              quality: SAVED_PHOTO_JPEG_QUALITY,
+              thumbnailMaxDim: THUMBNAIL_MAX_LONG_SIDE,
+              thumbnailQuality: THUMBNAIL_JPEG_QUALITY,
+              blurThreshold,
+              saveToDb: false,
+              waitForIdleSlot: skipBlurReview,
+              photoMeta,
+              fallbackCanvas: drawFullResVideoCanvas,
+              fallbackBlurCheck:
+                blurThreshold > 0
+                  ? (c) => checkImageBlurFromCanvas(c, blurThreshold)
+                  : undefined,
+            });
+            await finalizeProcessedShot({
+              ...processed,
+              photoTimestamp: pressTimestamp,
+              captureMethod,
+              captureMs,
+              captureMode: activeCaptureMode,
+            });
+          } catch {
+            const fallbackC = drawFullResVideoCanvas();
+            if (!fallbackC) return;
+            const procStart = performance.now();
+            const compressed = compressCanvasToJpeg(
+              fallbackC,
+              MAX_SAVED_PHOTO_LONG_SIDE,
+              SAVED_PHOTO_JPEG_QUALITY
+            );
+            const blur =
+              blurThreshold > 0
+                ? checkImageBlurFromCanvas(fallbackC, blurThreshold)
+                : { variance: 100, isBlurry: false };
+            const processingMs = Math.max(
+              1,
+              Math.round(performance.now() - procStart)
+            );
+            await finalizeProcessedShot({
+              ...compressed,
+              photoId: photoMeta.id,
+              photoTimestamp: pressTimestamp,
+              processingMs,
+              isBlurry: blur.isBlurry,
+              variance: blur.variance,
+              captureMethod: 'videoFrame',
+              captureMs,
+              captureMode: activeCaptureMode,
             });
           }
-          return finalizeProcessedShot({
-            ...processed,
-            captureMethod,
-          });
-        })
-        .catch(async () => {
-          const fallbackC = drawFullResVideoCanvas();
-          if (!fallbackC) return;
+        } else if (fallbackCanvasData) {
+          const procStart = performance.now();
           const compressed = compressCanvasToJpeg(
-            fallbackC,
-            photoMaxDim,
-            photoQuality
+            fallbackCanvasData,
+            MAX_SAVED_PHOTO_LONG_SIDE,
+            SAVED_PHOTO_JPEG_QUALITY
           );
           const blur =
             blurThreshold > 0
-              ? checkImageBlurFromCanvas(fallbackC, blurThreshold)
+              ? checkImageBlurFromCanvas(fallbackCanvasData, blurThreshold)
               : { variance: 100, isBlurry: false };
+          const processingMs = Math.max(
+            1,
+            Math.round(performance.now() - procStart)
+          );
           await finalizeProcessedShot({
             ...compressed,
+            photoId: photoMeta.id,
+            photoTimestamp: pressTimestamp,
+            processingMs,
             isBlurry: blur.isBlurry,
             variance: blur.variance,
             captureMethod: 'videoFrame',
+            captureMs,
+            captureMode: activeCaptureMode,
           });
-        });
-    } else if (fallbackCanvasData) {
-      const compressed = compressCanvasToJpeg(
-        fallbackCanvasData,
-        photoMaxDim,
-        photoQuality
-      );
-      const blur =
-        blurThreshold > 0
-          ? checkImageBlurFromCanvas(fallbackCanvasData, blurThreshold)
-          : { variance: 100, isBlurry: false };
-      finalizeProcessedShot({
-        ...compressed,
-        isBlurry: blur.isBlurry,
-        variance: blur.variance,
-        captureMethod: 'videoFrame',
-      }).catch(() => {});
-    }
+        }
+      } catch {
+        if (activeCaptureMode === 'high-quality') {
+          hideFreezeOverlay(freezeToken);
+        }
+        if (instantBitmap) {
+          try {
+            instantBitmap.close();
+          } catch {
+            // Ignore
+          }
+        }
+      } finally {
+        if (captureStageMarked) {
+          setCapturesInFlight(0);
+        }
+        syncPendingBadgeDom(Math.max(0, pendingCountRef.current - 1));
+      }
+    };
+
+    const nextInChain = captureQueueChainRef.current.then(
+      runQueuedJob,
+      runQueuedJob
+    );
+    captureQueueChainRef.current = nextInChain;
   };
 
-  const handleFilePicked = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFilePicked = async (
+    e: React.ChangeEvent<HTMLInputElement>,
+    sourceMethod: 'gallery' | 'nativeCamera' = 'gallery'
+  ) => {
     const files = e.target.files ? Array.from(e.target.files) : [];
     e.target.value = '';
     if (files.length === 0) return;
 
     const skipBlurReview = settings.continuousMode !== false;
     const blurThreshold = skipBlurReview ? 0 : DEFAULT_BLUR_THRESHOLD;
-    const galleryMaxDim = settings.cameraHighQuality !== false ? 0 : 2048;
-    const galleryQuality = 0.92;
+    const activeCaptureMode = resolveCaptureMode(settings.captureMode);
+
+    const shouldEnhanceImport = Boolean(
+      shouldEnhanceCaptureMethod(sourceMethod)
+    );
 
     if (files.length === 1) {
+      const ts = Date.now();
+      const photoMeta = {
+        id: `ph_${ts}_${Math.random().toString(36).slice(2, 7)}`,
+        sessionId,
+        timestamp: ts,
+        dateKey: getLocalDateKey(ts),
+        ...(shouldEnhanceImport ? { enhancementStatus: 'pending' as const } : {}),
+      };
       try {
         const processed = await processCaptureOffThread({
           blob: files[0],
-          maxDim: galleryMaxDim,
-          quality: galleryQuality,
+          maxDim: MAX_SAVED_PHOTO_LONG_SIDE,
+          quality: SAVED_PHOTO_JPEG_QUALITY,
+          thumbnailMaxDim: THUMBNAIL_MAX_LONG_SIDE,
+          thumbnailQuality: THUMBNAIL_JPEG_QUALITY,
           blurThreshold,
+          saveToDb: skipBlurReview,
+          photoMeta,
           fallbackBlurCheck:
             blurThreshold > 0
               ? (c) => checkImageBlurFromCanvas(c, blurThreshold)
@@ -1747,64 +2504,107 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
         });
         await finalizeProcessedShot({
           ...processed,
-          captureMethod: 'gallery',
+          photoTimestamp: ts,
+          captureMethod: sourceMethod,
+          captureMs: 0,
+          captureMode: activeCaptureMode,
         });
       } catch {
-        const canvas = await fileOrDataUrlToCanvas(files[0], galleryMaxDim);
+        const procStart = performance.now();
+        const canvas = await fileOrDataUrlToCanvas(
+          files[0],
+          MAX_SAVED_PHOTO_LONG_SIDE
+        );
         const compressed = compressCanvasToJpeg(
           canvas,
-          galleryMaxDim,
-          galleryQuality
+          MAX_SAVED_PHOTO_LONG_SIDE,
+          SAVED_PHOTO_JPEG_QUALITY
         );
         const blur =
           blurThreshold > 0
             ? checkImageBlurFromCanvas(canvas, blurThreshold)
             : { variance: 100, isBlurry: false };
+        const processingMs = Math.max(
+          1,
+          Math.round(performance.now() - procStart)
+        );
         await finalizeProcessedShot({
           ...compressed,
+          photoId: photoMeta.id,
+          photoTimestamp: ts,
+          processingMs,
           isBlurry: blur.isBlurry,
           variance: blur.variance,
-          captureMethod: 'gallery',
+          captureMethod: sourceMethod,
+          captureMs: 0,
+          captureMode: activeCaptureMode,
         });
       }
     } else {
       for (const file of files) {
+        const ts = Date.now();
+        const photoMeta = {
+          id: `ph_${ts}_${Math.random().toString(36).slice(2, 7)}`,
+          sessionId,
+          timestamp: ts,
+          dateKey: getLocalDateKey(ts),
+          ...(shouldEnhanceImport
+            ? { enhancementStatus: 'pending' as const }
+            : {}),
+        };
         try {
           const processed = await processCaptureOffThread({
             blob: file,
-            maxDim: galleryMaxDim,
-            quality: galleryQuality,
+            maxDim: MAX_SAVED_PHOTO_LONG_SIDE,
+            quality: SAVED_PHOTO_JPEG_QUALITY,
+            thumbnailMaxDim: THUMBNAIL_MAX_LONG_SIDE,
+            thumbnailQuality: THUMBNAIL_JPEG_QUALITY,
             blurThreshold: 0,
+            saveToDb: true,
+            photoMeta,
           });
-            await commitPhotoToDB(
-              {
-                dataUrl: processed.dataUrl,
-                width: processed.width,
-                height: processed.height,
-              },
-              undefined,
-              'gallery'
-            );
-          } catch {
-            const canvas = await fileOrDataUrlToCanvas(file, galleryMaxDim);
-            const compressed = compressCanvasToJpeg(
-              canvas,
-              galleryMaxDim,
-              galleryQuality
-            );
-            await commitPhotoToDB(
-              {
-                dataUrl: compressed.dataUrl,
-                width: compressed.width,
-                height: compressed.height,
-              },
-              undefined,
-              'gallery'
-            );
-          }
+          await finalizeProcessedShot({
+            ...processed,
+            photoTimestamp: ts,
+            captureMethod: sourceMethod,
+            captureMs: 0,
+            captureMode: activeCaptureMode,
+          });
+        } catch {
+          const procStart = performance.now();
+          const canvas = await fileOrDataUrlToCanvas(
+            file,
+            MAX_SAVED_PHOTO_LONG_SIDE
+          );
+          const compressed = compressCanvasToJpeg(
+            canvas,
+            MAX_SAVED_PHOTO_LONG_SIDE,
+            SAVED_PHOTO_JPEG_QUALITY
+          );
+          const processingMs = Math.max(
+            1,
+            Math.round(performance.now() - procStart)
+          );
+          await commitPhotoToDB(
+            {
+              dataUrl: compressed.dataUrl,
+              thumbnailDataUrl: compressed.thumbnailDataUrl,
+              width: compressed.width,
+              height: compressed.height,
+              byteLength: compressed.byteLength,
+            },
+            photoMeta,
+            sourceMethod,
+            {
+              captureMs: 0,
+              processingMs,
+              captureMode: activeCaptureMode,
+            }
+          );
         }
       }
-    };
+    }
+  };
 
   const handleConfirmReviewShot = async () => {
     if (!reviewShot) return;
@@ -1813,18 +2613,32 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
     await commitPhotoToDB(
       {
         dataUrl: shot.dataUrl,
+        thumbnailDataUrl: shot.thumbnailDataUrl,
         width: shot.width,
         height: shot.height,
+        byteLength: shot.byteLength,
       },
       undefined,
-      (shot as PendingReviewShot & { captureMethod?: 'takePhoto' | 'videoFrame' | 'gallery' }).captureMethod
+      shot.captureMethod,
+      {
+        captureMs: shot.captureMs,
+        processingMs: shot.processingMs,
+        captureMode: resolveCaptureMode(settings.captureMode),
+      }
     );
   };
 
+  const availableZoomPresets = resolveAvailableZoomPresets(hardwareZoomRange);
+  const hasHardwareZoom = availableZoomPresets.length >= 2;
+
   const handleCycleZoomPreset = () => {
+    if (!hasHardwareZoom) return;
     const cur = zoomValueRef.current;
-    const curIdx = ZOOM_PRESETS.findIndex((p) => Math.abs(cur - p) < 0.25);
-    const next = ZOOM_PRESETS[(curIdx + 1) % ZOOM_PRESETS.length];
+    const curIdx = availableZoomPresets.findIndex(
+      (p) => Math.abs(cur - p) < 0.25
+    );
+    const next =
+      availableZoomPresets[(curIdx + 1) % availableZoomPresets.length];
     applyZoom(next, true, true);
   };
 
@@ -1869,9 +2683,11 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
     }
   };
 
-  // Pinch-to-zoom touch handlers updating DOM directly without re-rendering during motion
+  // Pinch-to-zoom touch handlers updating hardware zoom constraint only (no CSS scaling)
   const handleTouchStart = (e: React.TouchEvent) => {
-    if (!settings.zoomControls || e.touches.length !== 2) return;
+    if (!settings.zoomControls || !hasHardwareZoom || e.touches.length !== 2) {
+      return;
+    }
     const dx = e.touches[0].clientX - e.touches[1].clientX;
     const dy = e.touches[0].clientY - e.touches[1].clientY;
     pinchStartDistRef.current = Math.hypot(dx, dy);
@@ -1882,6 +2698,7 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
   const handleTouchMove = (e: React.TouchEvent) => {
     if (
       !settings.zoomControls ||
+      !hasHardwareZoom ||
       e.touches.length !== 2 ||
       pinchStartDistRef.current === null
     ) {
@@ -1909,21 +2726,43 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
     <div
       className="relative w-full h-[calc(100dvh-68px-env(safe-area-inset-bottom,0px))] bg-slate-950 overflow-hidden select-none touch-pan-y"
       dir="rtl"
-      onTouchStart={handleTouchStart}
+      onPointerDown={() => {
+        if (cameraStateRef.current === 'active') {
+          recordUserActivity();
+        }
+      }}
+      onTouchStart={(e) => {
+        if (cameraStateRef.current === 'active') {
+          recordUserActivity();
+        }
+        handleTouchStart(e);
+      }}
       onTouchMove={handleTouchMove}
       onTouchEnd={handleTouchEnd}
     >
       {/* Hidden gallery input (multi-select supported, no capture attribute) */}
       <input
         ref={galleryInputRef}
+        data-testid="camera-gallery-input"
         type="file"
         accept="image/*"
         multiple
-        onChange={handleFilePicked}
+        onChange={(e) => void handleFilePicked(e, 'gallery')}
         className="hidden"
       />
 
-      {/* Live Video Stream */}
+      {/* Hidden native phone camera input (accept=image/* capture=environment) */}
+      <input
+        ref={nativeCameraInputRef}
+        data-testid="camera-native-input"
+        type="file"
+        accept="image/*"
+        capture="environment"
+        onChange={(e) => void handleFilePicked(e, 'nativeCamera')}
+        className="hidden"
+      />
+
+      {/* Live Video Stream (never CSS-scaled or filtered) */}
       <video
         ref={videoRef}
         playsInline
@@ -1932,6 +2771,14 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
         className={`w-full h-full object-cover ${
           cameraState === 'active' ? 'opacity-100' : 'opacity-0'
         }`}
+      />
+
+      {/* Instant Freeze-Frame Canvas Overlay covering the viewfinder on shutter press */}
+      <canvas
+        ref={freezeOverlayCanvasRef}
+        data-testid="camera-freeze-overlay"
+        style={{ opacity: 0 }}
+        className="pointer-events-none absolute inset-0 w-full h-full object-cover z-20"
       />
 
       {/* 120ms White Shutter Feedback Overlay */}
@@ -1953,14 +2800,22 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
                 الكاميرا غير متاحة
               </h1>
               <p className="text-xs text-slate-300 leading-relaxed">
-                اسمح باستخدام الكاميرا من إعدادات المتصفح أو الموقع.
+                اسمح باستخدام الكاميرا من إعدادات المتصفح أو التقط بكاميرا الهاتف.
               </p>
             </div>
             <div className="flex flex-col gap-2.5 pt-1">
               <button
                 type="button"
-                onClick={() => galleryInputRef.current?.click()}
+                onClick={() => nativeCameraInputRef.current?.click()}
                 className="min-h-[50px] w-full px-5 rounded-2xl bg-emerald-500 text-white font-extrabold text-sm flex items-center justify-center gap-2 active:scale-95 transition"
+              >
+                <Smartphone className="w-5 h-5" />
+                <span>التقاط بكاميرا الهاتف الأصلية</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => galleryInputRef.current?.click()}
+                className="min-h-[48px] w-full px-5 rounded-2xl bg-slate-800 text-slate-100 font-bold text-sm flex items-center justify-center gap-2 active:scale-95 transition"
               >
                 <ImagePlus className="w-5 h-5" />
                 <span>اختيار من المعرض</span>
@@ -1968,7 +2823,7 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
               <button
                 type="button"
                 onClick={() => startCamera({ silentBackground: false })}
-                className="min-h-[48px] w-full px-4 rounded-2xl bg-slate-800 text-slate-100 font-bold text-sm flex items-center justify-center gap-2 active:scale-95 transition"
+                className="min-h-[48px] w-full px-4 rounded-2xl bg-slate-800/70 text-slate-300 font-bold text-sm flex items-center justify-center gap-2 active:scale-95 transition"
               >
                 <RotateCcw className="w-4 h-4" />
                 <span>إعادة المحاولة</span>
@@ -1978,12 +2833,12 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
         </div>
       )}
 
-      {/* Starting Skeleton Viewfinder (controls completely hidden until video is playing) */}
+      {/* Starting Skeleton Viewfinder (NO CSS animations over camera viewport) */}
       {cameraState === 'starting' && (
         <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-slate-950 px-6">
-          <div className="w-full max-w-sm aspect-[3/4] rounded-[24px] bg-slate-900/90 border border-slate-800/80 animate-pulse flex flex-col items-center justify-center gap-3">
+          <div className="w-full max-w-sm aspect-[3/4] rounded-[24px] bg-slate-900 border border-slate-800 flex flex-col items-center justify-center gap-3">
             <div className="w-14 h-14 rounded-2xl bg-slate-800 flex items-center justify-center text-emerald-400">
-              <Camera className="w-7 h-7 animate-pulse" />
+              <Camera className="w-7 h-7" />
             </div>
             <span className="text-sm font-bold text-slate-300">
               جاري تشغيل الكاميرا…
@@ -1992,9 +2847,74 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
         </div>
       )}
 
-      {/* Active Camera Controls ONLY */}
+      {/* Idle Battery-Saving Viewfinder State — full-viewfinder tap target resumes immediately */}
+      {cameraState === 'idle' && (
+        <button
+          type="button"
+          data-testid="camera-idle-resume-btn"
+          onClick={() => {
+            pausedByVisibilityRef.current = false;
+            notifyCameraActivity();
+            void startCamera({
+              silentBackground: false,
+              lockedDeviceId: activeDeviceIdRef.current,
+            });
+          }}
+          className="absolute inset-0 z-20 flex flex-col items-center justify-center px-6 bg-slate-950 text-center cursor-pointer"
+        >
+          <div className="w-full max-w-xs rounded-[24px] bg-slate-900 border border-slate-800 p-6 flex flex-col items-center gap-3">
+            <div className="w-14 h-14 rounded-2xl bg-slate-800 flex items-center justify-center text-emerald-400">
+              <Camera className="w-7 h-7" />
+            </div>
+            <p className="text-sm font-extrabold text-slate-100 leading-relaxed">
+              الكاميرا متوقفة لتوفير البطارية · المس الشاشة للتشغيل
+            </p>
+          </div>
+        </button>
+      )}
+
+      {/* Active Camera Controls ONLY — NO backdrop-blur, CSS animations, filters, or large box-shadows */}
       {cameraState === 'active' && (
         <>
+          {/* Photo Counter with direct-DOM Queue Pending Badge */}
+          <div
+            data-testid="camera-photo-counter"
+            className="pointer-events-none absolute top-[max(12px,env(safe-area-inset-top,0px))] right-3.5 z-30 h-9 px-3 rounded-full bg-black/70 border border-white/15 text-white text-xs font-extrabold flex items-center gap-2"
+          >
+            <Camera className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+            <span ref={savedCountRef} className="tabular-nums">
+              {savedPhotoCount}
+            </span>
+            <span
+              ref={pendingBadgeRef}
+              data-testid="camera-pending-count"
+              style={{ display: 'none' }}
+              className="px-1.5 py-0.5 rounded-full bg-amber-400 text-slate-950 text-[10px] font-extrabold tabular-nums leading-none"
+            />
+          </div>
+
+          {/* Top-left subtle chips: Battery Saver indicator + optional preview resolution notice */}
+          {(isBatterySaverOn || previewDowngradedNotice) && (
+            <div className="pointer-events-none absolute top-[max(12px,env(safe-area-inset-top,0px))] left-3.5 z-20 flex flex-col items-end gap-1.5">
+              {isBatterySaverOn && (
+                <div
+                  data-testid="camera-battery-saver-chip"
+                  className="h-8 px-2.5 rounded-full bg-amber-500/20 border border-amber-400/50 text-amber-200 text-[11px] font-extrabold flex items-center"
+                >
+                  توفير البطارية
+                </div>
+              )}
+              {previewDowngradedNotice && (
+                <div
+                  data-testid="camera-preview-downgraded-note"
+                  className="px-2.5 py-1.5 rounded-full bg-black/70 border border-white/15 text-slate-200 text-[10px] font-bold"
+                >
+                  خُفضت دقة المعاينة لتحسين السلاسة
+                </div>
+              )}
+            </div>
+          )}
+
           {/* No candidate supports torch — shown ONCE per unsupported device */}
           {noTorchNoticeVisible && (
             <div className="absolute top-[calc(5.2rem+env(safe-area-inset-top,0px))] inset-x-4 z-20 flex justify-center">
@@ -2027,11 +2947,11 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
             </div>
           )}
 
-          {/* Vertical Icon-Only Semi-Transparent Edge Toolbar (Right default, or Left from Settings) */}
+          {/* Vertical Icon-Only Edge Toolbar (Right default, or Left from Settings; NO backdrop-blur / shadow) */}
           <div
             data-testid="camera-vertical-toolbar"
             data-side={toolbarOnLeft ? 'left' : 'right'}
-            className={`absolute top-1/2 -translate-y-1/2 z-30 flex flex-col items-center gap-2 p-1.5 rounded-full bg-black/45 backdrop-blur-md border border-white/15 shadow-lg ${
+            className={`absolute top-1/2 -translate-y-1/2 z-30 flex flex-col items-center gap-2 p-1.5 rounded-full bg-black/65 border border-white/15 ${
               toolbarOnLeft ? 'left-3' : 'right-3'
             }`}
             onTouchStart={(e) => e.stopPropagation()}
@@ -2043,12 +2963,12 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
                 onClick={cycleFlashMode}
                 data-torch-on={torchOn ? 'true' : 'false'}
                 data-flash-mode={flashMode}
-                className={`relative w-11 h-11 rounded-full flex items-center justify-center transition active:scale-90 ${
+                className={`relative w-11 h-11 rounded-full flex items-center justify-center ${
                   torchOn
                     ? 'bg-amber-400 text-slate-950'
                     : flashMode === 'off' || flashMode === 'on'
-                    ? 'text-white/60 hover:bg-white/10'
-                    : 'text-white hover:bg-white/15'
+                    ? 'text-white/60'
+                    : 'text-white'
                 }`}
                 aria-label={`الفلاش: ${flashMode}`}
                 title="الفلاش"
@@ -2069,41 +2989,43 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
               </button>
             )}
 
-            {/* 2) Zoom cycle (tap rotates 1x -> 2x -> 3x) */}
-            <div className="relative flex items-center justify-center">
-              <button
-                type="button"
-                onClick={handleCycleZoomPreset}
-                className={`w-11 h-11 rounded-full flex items-center justify-center transition active:scale-90 ${
-                  activePresetZoom > 1
-                    ? 'bg-emerald-500 text-white'
-                    : 'text-white hover:bg-white/15'
-                }`}
-                aria-label="التقريب"
-                title="التقريب (1x / 2x / 3x)"
-              >
-                <ZoomIn className="w-5 h-5" />
-              </button>
+            {/* 2) Hardware Zoom cycle ONLY when track supports zoom (no CSS preview scaling) */}
+            {settings.zoomControls && hasHardwareZoom && (
+              <div className="relative flex items-center justify-center">
+                <button
+                  type="button"
+                  data-testid="camera-zoom-btn"
+                  onClick={handleCycleZoomPreset}
+                  className={`w-11 h-11 rounded-full flex items-center justify-center ${
+                    activePresetZoom > 1
+                      ? 'bg-emerald-500 text-white'
+                      : 'text-white'
+                  }`}
+                  aria-label="التقريب"
+                  title="التقريب (1x / 2x / 3x)"
+                >
+                  <ZoomIn className="w-5 h-5" />
+                </button>
 
-              <div
-                ref={zoomLabelRef}
-                dir="ltr"
-                className={`pointer-events-none absolute top-1/2 -translate-y-1/2 px-2 py-0.5 rounded-full bg-black/70 text-emerald-300 text-[11px] font-extrabold tabular-nums transition-opacity duration-200 ${
-                  toolbarOnLeft ? 'left-14' : 'right-14'
-                } ${showZoomOverlay ? 'opacity-100' : 'opacity-0'}`}
-              >
-                1.0x
+                <div
+                  ref={zoomLabelRef}
+                  dir="ltr"
+                  style={{ opacity: 0 }}
+                  className={`pointer-events-none absolute top-1/2 -translate-y-1/2 px-2 py-0.5 rounded-full bg-black/75 text-emerald-300 text-[11px] font-extrabold tabular-nums ${
+                    toolbarOnLeft ? 'left-14' : 'right-14'
+                  }`}
+                >
+                  1.0x
+                </div>
               </div>
-            </div>
+            )}
 
             {/* 3) More options (⋯) */}
             <button
               type="button"
               onClick={() => setShowMoreMenu((prev) => !prev)}
-              className={`w-11 h-11 rounded-full flex items-center justify-center transition active:scale-90 ${
-                showMoreMenu
-                  ? 'bg-white/25 text-white'
-                  : 'text-white hover:bg-white/15'
+              className={`w-11 h-11 rounded-full flex items-center justify-center ${
+                showMoreMenu ? 'bg-white/25 text-white' : 'text-white'
               }`}
               aria-label="المزيد من الخيارات"
               aria-expanded={showMoreMenu}
@@ -2122,17 +3044,29 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
               />
               <div
                 data-testid="camera-more-menu"
-                className={`absolute top-1/2 -translate-y-1/2 z-30 w-52 rounded-2xl bg-slate-900/90 backdrop-blur-md border border-white/15 shadow-2xl p-1.5 flex flex-col gap-1 text-white text-xs font-bold ${
+                className={`absolute top-1/2 -translate-y-1/2 z-30 w-56 rounded-2xl bg-slate-900/95 border border-white/15 p-1.5 flex flex-col gap-1 text-white text-xs font-bold ${
                   toolbarOnLeft ? 'left-16' : 'right-16'
                 }`}
               >
+                <button
+                  type="button"
+                  data-testid="camera-native-btn"
+                  onClick={() => {
+                    setShowMoreMenu(false);
+                    nativeCameraInputRef.current?.click();
+                  }}
+                  className="w-full min-h-[42px] px-3 rounded-xl flex items-center gap-2.5 text-right"
+                >
+                  <Smartphone className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span>التقاط بكاميرا الهاتف الأصلية</span>
+                </button>
                 <button
                   type="button"
                   onClick={() => {
                     setShowMoreMenu(false);
                     galleryInputRef.current?.click();
                   }}
-                  className="w-full min-h-[42px] px-3 rounded-xl hover:bg-white/10 flex items-center gap-2.5 text-right"
+                  className="w-full min-h-[42px] px-3 rounded-xl flex items-center gap-2.5 text-right"
                 >
                   <ImagePlus className="w-4 h-4 text-emerald-400 shrink-0" />
                   <span>اختيار من المعرض</span>
@@ -2141,13 +3075,13 @@ export const CameraScreen: React.FC<CameraScreenProps> = ({
             </>
           )}
 
-          {/* Bottom: ONLY the Big Green Capture Button */}
+          {/* Bottom: ONLY the Big Green Capture Button (NO large shadow) */}
           <div className="pointer-events-none absolute bottom-0 inset-x-0 z-20 pb-6 flex justify-center">
             <button
               type="button"
               onClick={() => handleCapture()}
               aria-label="التقاط صورة للرف"
-              className="pointer-events-auto w-[78px] h-[78px] rounded-full bg-white p-1.5 flex items-center justify-center active:scale-95 shadow-2xl"
+              className="pointer-events-auto w-[78px] h-[78px] rounded-full bg-white p-1.5 flex items-center justify-center"
             >
               <span className="w-full h-full rounded-full bg-emerald-500 border-4 border-white flex items-center justify-center">
                 <Camera className="w-7 h-7 text-white" />

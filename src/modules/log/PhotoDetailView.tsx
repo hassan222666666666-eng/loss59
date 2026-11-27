@@ -3,8 +3,11 @@ import {
   Camera,
   Check,
   CheckCircle2,
+  MoreHorizontal,
+  RotateCcw,
   RotateCw,
   SkipForward,
+  Sparkles,
   X,
 } from 'lucide-react';
 import { ShelfPhoto } from '../../types';
@@ -25,6 +28,8 @@ interface PhotoDetailViewProps {
   onCompletePhoto: () => Promise<void>;
   onSkipPhoto: () => void;
   onRotatePhoto: () => Promise<void>;
+  onReEnhancePhoto?: () => Promise<void>;
+  onRestoreOriginalPhoto?: () => Promise<void>;
   onClose: () => void;
 }
 
@@ -36,6 +41,8 @@ export const PhotoDetailView: React.FC<PhotoDetailViewProps> = ({
   onCompletePhoto,
   onSkipPhoto,
   onRotatePhoto,
+  onReEnhancePhoto,
+  onRestoreOriginalPhoto,
   onClose,
 }) => {
   const viewportRef = useRef<HTMLDivElement | null>(null);
@@ -53,6 +60,10 @@ export const PhotoDetailView: React.FC<PhotoDetailViewProps> = ({
   const [panDrag, setPanDrag] = useState<PanDragState | null>(null);
   const [isCompleting, setIsCompleting] = useState(false);
   const [isRotating, setIsRotating] = useState(false);
+  const [isHoldingOriginal, setIsHoldingOriginal] = useState(false);
+  const [showMoreMenu, setShowMoreMenu] = useState(false);
+  const [isReEnhancing, setIsReEnhancing] = useState(false);
+  const [isRestoringOriginal, setIsRestoringOriginal] = useState(false);
 
   useEffect(() => {
     const el = viewportRef.current;
@@ -83,6 +94,8 @@ export const PhotoDetailView: React.FC<PhotoDetailViewProps> = ({
     setPan({ x: 0, y: 0 });
     setShowFloatingControls(true);
     setPanDrag(null);
+    setIsHoldingOriginal(false);
+    setShowMoreMenu(false);
     if (photo?.width && photo?.height) {
       setNaturalSize({ width: photo.width, height: photo.height });
     } else {
@@ -233,6 +246,7 @@ export const PhotoDetailView: React.FC<PhotoDetailViewProps> = ({
 
   const handleRotateClick = async () => {
     if (isRotating || !photo?.dataUrl) return;
+    setShowMoreMenu(false);
     setIsRotating(true);
     try {
       setZoom(1);
@@ -240,6 +254,28 @@ export const PhotoDetailView: React.FC<PhotoDetailViewProps> = ({
       await onRotatePhoto();
     } finally {
       setIsRotating(false);
+    }
+  };
+
+  const handleReEnhanceClick = async () => {
+    if (!onReEnhancePhoto || isReEnhancing) return;
+    setShowMoreMenu(false);
+    setIsReEnhancing(true);
+    try {
+      await onReEnhancePhoto();
+    } finally {
+      setIsReEnhancing(false);
+    }
+  };
+
+  const handleRestoreOriginalClick = async () => {
+    if (!onRestoreOriginalPhoto || isRestoringOriginal) return;
+    setShowMoreMenu(false);
+    setIsRestoringOriginal(true);
+    try {
+      await onRestoreOriginalPhoto();
+    } finally {
+      setIsRestoringOriginal(false);
     }
   };
 
@@ -327,7 +363,12 @@ export const PhotoDetailView: React.FC<PhotoDetailViewProps> = ({
             className="relative max-w-full max-h-full transition-transform duration-75"
           >
             <img
-              src={photo.dataUrl}
+              data-testid="photo-detail-stage-img"
+              src={
+                isHoldingOriginal && photo.originalDataUrl
+                  ? photo.originalDataUrl
+                  : photo.dataUrl
+              }
               alt="صورة الرف"
               draggable={false}
               onLoad={(e) => {
@@ -349,6 +390,16 @@ export const PhotoDetailView: React.FC<PhotoDetailViewProps> = ({
           <div className="flex flex-col items-center gap-2 text-slate-400 text-xs px-6 text-center">
             <Camera className="w-8 h-8 opacity-60" />
             <span>تم تنظيف صورة الرف لتوفير المساحة</span>
+          </div>
+        )}
+
+        {/* Active Before/After Hold Badge */}
+        {isHoldingOriginal && photo.originalDataUrl && (
+          <div
+            data-testid="photo-original-badge"
+            className="absolute bottom-3 right-3 z-20 px-3 py-1 rounded-full bg-amber-500 text-slate-950 text-xs font-extrabold shadow pointer-events-none"
+          >
+            الصورة الأصلية
           </div>
         )}
 
@@ -382,7 +433,30 @@ export const PhotoDetailView: React.FC<PhotoDetailViewProps> = ({
               </div>
             </div>
 
-            <div className="flex items-center gap-1.5 pointer-events-auto">
+            <div className="relative flex items-center gap-1.5 pointer-events-auto">
+              {Boolean(photo.originalDataUrl) && Boolean(photo.dataUrl) && (
+                <button
+                  type="button"
+                  data-testid="photo-before-after-btn"
+                  onPointerDown={(e) => {
+                    e.stopPropagation();
+                    setIsHoldingOriginal(true);
+                  }}
+                  onPointerUp={() => setIsHoldingOriginal(false)}
+                  onPointerLeave={() => setIsHoldingOriginal(false)}
+                  onPointerCancel={() => setIsHoldingOriginal(false)}
+                  onContextMenu={(e) => e.preventDefault()}
+                  className={`h-10 px-3 rounded-full text-xs font-extrabold flex items-center gap-1 transition select-none touch-none ${
+                    isHoldingOriginal
+                      ? 'bg-amber-500 text-slate-950'
+                      : 'bg-black/65 text-white'
+                  }`}
+                  aria-label="معاينة الأصل قبل وبعد"
+                >
+                  <span>قبل/بعد</span>
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={handleRotateClick}
@@ -395,6 +469,55 @@ export const PhotoDetailView: React.FC<PhotoDetailViewProps> = ({
                 />
                 <span>تدوير</span>
               </button>
+
+              {Boolean(photo.originalDataUrl) && Boolean(photo.dataUrl) && (
+                <>
+                  <button
+                    type="button"
+                    data-testid="photo-detail-more-btn"
+                    onClick={() => setShowMoreMenu((v) => !v)}
+                    className="w-10 h-10 rounded-full bg-black/65 text-white flex items-center justify-center active:scale-95 transition"
+                    aria-label="المزيد من الخيارات"
+                  >
+                    <MoreHorizontal className="w-5 h-5" />
+                  </button>
+
+                  {showMoreMenu && (
+                    <div
+                      data-testid="photo-detail-more-menu"
+                      className="absolute top-12 left-0 w-48 rounded-2xl bg-slate-900/95 border border-white/15 shadow-2xl overflow-hidden backdrop-blur-md z-30"
+                    >
+                      <button
+                        type="button"
+                        data-testid="photo-re-enhance-btn"
+                        disabled={isReEnhancing || isRestoringOriginal}
+                        onClick={handleReEnhanceClick}
+                        className="w-full px-3.5 py-3 text-right text-xs font-extrabold text-white hover:bg-white/10 flex items-center gap-2 border-b border-white/10 disabled:opacity-50"
+                      >
+                        <Sparkles className="w-4 h-4 text-emerald-400 shrink-0" />
+                        <span>
+                          {isReEnhancing ? 'جاري التحسين...' : 'إعادة التحسين'}
+                        </span>
+                      </button>
+
+                      <button
+                        type="button"
+                        data-testid="photo-restore-original-btn"
+                        disabled={isReEnhancing || isRestoringOriginal}
+                        onClick={handleRestoreOriginalClick}
+                        className="w-full px-3.5 py-3 text-right text-xs font-extrabold text-amber-300 hover:bg-white/10 flex items-center gap-2 disabled:opacity-50"
+                      >
+                        <RotateCcw className="w-4 h-4 shrink-0" />
+                        <span>
+                          {isRestoringOriginal
+                            ? 'جاري الاستعادة...'
+                            : 'استعادة الأصل'}
+                        </span>
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
             </div>
           </div>
         )}

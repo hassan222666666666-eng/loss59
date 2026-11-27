@@ -19,6 +19,7 @@ export interface MusicTrackRecord {
   streamUrl?: string;
   duration: number; // seconds (0 if unknown / live radio)
   size: number; // bytes (0 for radio)
+  contentHash?: string; // SHA-256 / content fingerprint to prevent re-adding renamed duplicates
   order: number;
   missingFile?: boolean;
   favorite?: boolean;
@@ -87,6 +88,7 @@ export interface MusicBackupTrackMeta {
   streamUrl?: string;
   duration: number;
   size: number;
+  contentHash?: string;
   order: number;
   favorite?: boolean;
   lastPlayedAt?: number;
@@ -127,6 +129,7 @@ export interface MusicImportProgress {
 export interface MusicImportReport {
   addedCount: number;
   skippedDuplicatesCount: number;
+  skippedDuplicateFiles?: string[];
   failedCount: number;
   cancelled: boolean;
   failedFiles: MusicImportFailedItem[];
@@ -140,6 +143,7 @@ export interface MusicAddFilesResult {
   rejectedReason?: string;
   skippedInvalid: number;
   skippedDuplicatesCount: number;
+  skippedDuplicateFiles?: string[];
   failedCount: number;
   failedFiles: MusicImportFailedItem[];
   cancelled: boolean;

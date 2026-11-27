@@ -4,15 +4,20 @@ import {
 } from './coverArt';
 import {
   canAddAudioBytes,
+  computeAudioContentHash,
   DEFAULT_MUSIC_MAX_STORAGE_MB,
   deriveShortTrackName,
   findMatchingMissingTrack,
   formatMusicImportSummary,
   isBrowserStorageLow,
   isDuplicateAudioFile,
+  isDuplicateAudioTitleAndDuration,
+  isDuplicateRadioStation,
+  isSupportedAudioFile,
   isValidRadioUrl,
   makeAudioDuplicateKey,
   mergeImportedMusicTracks,
+  normalizeAudioTitleForDuplicate,
   normalizeTrackOrder,
   reorderTrackList,
 } from './musicLogic';
@@ -325,6 +330,9 @@ export async function addAudioFilesToLibrary(
       : 0;
 
   const seenBatchKeys = new Set<string>();
+  const seenBatchHashes = new Set<string>();
+  const seenBatchTitleDurations: Array<{ titleNorm: string; duration: number }> = [];
+  const skippedDuplicateFiles: string[] = [];
   const addedTracks: MusicTrackRecord[] = [];
   const reattachedTracks: MusicTrackRecord[] = [];
   const failedFiles: MusicImportFailedItem[] = [];
@@ -362,8 +370,19 @@ export async function addAudioFilesToLibrary(
       continue;
     }
 
+    if (!isSupportedAudioFile(file)) {
+      skippedInvalid += 1;
+      failedFiles.push({
+        fileName,
+        reason: 'صيغة الملف غير مدعومة كملف صوتي',
+      });
+      await yieldToMainThread();
+      continue;
+    }
+
     if (isDuplicateAudioFile(workingTracks, seenBatchKeys, file.name, file.size)) {
       skippedDuplicatesCount += 1;
+      skippedDuplicateFiles.push(fileName);
       await yieldToMainThread();
       continue;
     }
@@ -398,10 +417,68 @@ export async function addAudioFilesToLibrary(
       break;
     }
 
+    const contentHash = await computeAudioContentHash(buffer);
+
+    // Backfill contentHash lazily only for existing tracks matching the same byte size
+    for (let j = 0; j < workingTracks.length; j++) {
+      const existing = workingTracks[j];
+      if (
+        existing.kind === 'file' &&
+        !existing.missingFile &&
+        !existing.contentHash &&
+        existing.size === copiedBlob.size
+      ) {
+        const existingBlob = await getMusicBlob(existing.id);
+        if (existingBlob) {
+          try {
+            const existingBuf = await existingBlob.arrayBuffer();
+            const existingHash = await computeAudioContentHash(existingBuf);
+            const patched = { ...existing, contentHash: existingHash };
+            workingTracks[j] = patched;
+            const tx = db.transaction(STORE_TRACKS, 'readwrite');
+            tx.objectStore(STORE_TRACKS).put(patched);
+          } catch {
+            // Non-fatal
+          }
+        }
+      }
+    }
+
+    if (
+      isDuplicateAudioFile(
+        workingTracks,
+        seenBatchKeys,
+        file.name,
+        copiedBlob.size,
+        contentHash,
+        seenBatchHashes
+      )
+    ) {
+      skippedDuplicatesCount += 1;
+      skippedDuplicateFiles.push(fileName);
+      await yieldToMainThread();
+      continue;
+    }
+
     const [duration, coverDataUrl] = await Promise.all([
       extractAudioDuration(copiedBlob, 1200),
       extractAndCompressCoverFromBuffer(buffer),
     ]);
+
+    const derivedTitle = deriveShortTrackName(file.name);
+    if (
+      isDuplicateAudioTitleAndDuration(
+        workingTracks,
+        seenBatchTitleDurations,
+        derivedTitle,
+        duration
+      )
+    ) {
+      skippedDuplicatesCount += 1;
+      skippedDuplicateFiles.push(fileName);
+      await yieldToMainThread();
+      continue;
+    }
 
     const now = Date.now();
     const matchingMissing = findMatchingMissingTrack(
@@ -420,6 +497,7 @@ export async function addAudioFilesToLibrary(
         mimeType,
         duration: duration > 0 ? duration : matchingMissing.duration,
         size: copiedBlob.size,
+        contentHash,
         coverDataUrl: matchingMissing.coverDataUrl || coverDataUrl,
         missingFile: false,
         updatedAt: now,
@@ -439,11 +517,12 @@ export async function addAudioFilesToLibrary(
       savedTrack = {
         id,
         kind: 'file',
-        title: deriveShortTrackName(file.name),
+        title: derivedTitle,
         fileName: file.name,
         mimeType,
         duration,
         size: copiedBlob.size,
+        contentHash,
         order: nextOrder++,
         missingFile: false,
         coverDataUrl,
@@ -469,7 +548,14 @@ export async function addAudioFilesToLibrary(
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error);
       });
-      seenBatchKeys.add(makeAudioDuplicateKey(file.name, file.size));
+      seenBatchKeys.add(makeAudioDuplicateKey(file.name, copiedBlob.size));
+      seenBatchHashes.add(contentHash);
+      if (duration > 0) {
+        seenBatchTitleDurations.push({
+          titleNorm: normalizeAudioTitleForDuplicate(savedTrack.title),
+          duration,
+        });
+      }
       currentUsed += copiedBlob.size;
       options?.onTrackWritten?.();
     } catch {
@@ -506,6 +592,7 @@ export async function addAudioFilesToLibrary(
         : undefined,
     skippedInvalid,
     skippedDuplicatesCount,
+    skippedDuplicateFiles,
     failedCount: failedFiles.length,
     failedFiles,
     cancelled,
@@ -552,11 +639,12 @@ export async function reattachMissingAudioFile(
     return { ok: false, error: 'تعذر قراءة الملف الصوتي.' };
   }
 
-  const [duration, extractedCover] = await Promise.all([
+  const [duration, extractedCover, contentHash] = await Promise.all([
     extractAudioDuration(copiedBlob),
     target.coverDataUrl
       ? Promise.resolve(undefined)
       : extractAndCompressCoverFromBuffer(buffer),
+    computeAudioContentHash(buffer),
   ]);
   const now = Date.now();
   const updated: MusicTrackRecord = {
@@ -565,6 +653,7 @@ export async function reattachMissingAudioFile(
     mimeType,
     duration: duration > 0 ? duration : target.duration,
     size: copiedBlob.size,
+    contentHash,
     coverDataUrl: target.coverDataUrl || extractedCover,
     missingFile: false,
     updatedAt: now,
@@ -598,6 +687,9 @@ export async function addRadioStationToLibrary(
   }
   const cleanTitle = title.trim() || 'إذاعة مباشرة';
   const existing = await getAllMusicTracks();
+  if (isDuplicateRadioStation(existing, cleanUrl)) {
+    throw new Error('هذه الإذاعة مضافة مسبقاً');
+  }
   const nextOrder =
     existing.length > 0 ? Math.max(...existing.map((t) => t.order)) + 1 : 0;
   const now = Date.now();
@@ -706,6 +798,44 @@ export async function toggleTrackListMembership(
       updatedAt: Date.now(),
     };
   });
+}
+
+export async function addTracksToMusicList(
+  trackIds: ReadonlyArray<string>,
+  listId: string
+): Promise<number> {
+  const idSet = new Set(trackIds);
+  if (idSet.size === 0) return 0;
+
+  const tracks = await getAllMusicTracks();
+  const now = Date.now();
+  const toUpdate: MusicTrackRecord[] = [];
+
+  for (const track of tracks) {
+    if (!idSet.has(track.id)) continue;
+    const existing = Array.isArray(track.listIds) ? track.listIds : [];
+    if (existing.includes(listId)) continue; // Prevent adding duplicate track to the same list
+    toUpdate.push({
+      ...track,
+      listIds: [...existing, listId],
+      updatedAt: now,
+    });
+  }
+
+  if (toUpdate.length === 0) return 0;
+
+  const db = await initMusicDB();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE_TRACKS, 'readwrite');
+    const store = tx.objectStore(STORE_TRACKS);
+    for (const item of toUpdate) {
+      store.put(item);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+
+  return toUpdate.length;
 }
 
 export async function markTrackPlayed(

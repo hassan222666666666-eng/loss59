@@ -32,6 +32,7 @@ import {
 import { formatBytesArabic } from '../../utils/arabicText';
 import { TRACK_TILE_COLORS } from './coverArt';
 import {
+  AUDIO_PICKER_ACCEPT,
   MusicAudioImporterTrigger,
   MusicImportStatusPanel,
 } from './MusicAudioImporter';
@@ -111,11 +112,13 @@ interface MusicPlayerSheetProps {
     colorId: string | undefined
   ) => Promise<void>;
   onToggleTrackInList: (trackId: string, listId: string) => Promise<void>;
+  onAddTracksToList?: (listId: string, trackIds: string[]) => Promise<number>;
   onCreateList: (name: string) => Promise<MusicCustomList>;
   onDeleteList: (listId: string) => Promise<void>;
   onReorderTrack: (trackId: string, dir: 'up' | 'down') => Promise<void>;
   onDeleteTrack: (trackId: string) => Promise<void>;
   onGetDiagnostics: () => MusicPlaybackDiagnostics;
+  batterySaverOn?: boolean;
 }
 
 export const MusicPlayerSheet: React.FC<MusicPlayerSheetProps> = ({
@@ -161,11 +164,13 @@ export const MusicPlayerSheet: React.FC<MusicPlayerSheetProps> = ({
   onUpdateTrackCover,
   onSetTrackTileColor,
   onToggleTrackInList,
+  onAddTracksToList,
   onCreateList,
   onDeleteList,
   onReorderTrack,
   onDeleteTrack,
   onGetDiagnostics,
+  batterySaverOn = false,
 }) => {
   const reattachInputRef = useRef<HTMLInputElement | null>(null);
   const reattachTargetIdRef = useRef<string | null>(null);
@@ -188,6 +193,10 @@ export const MusicPlayerSheet: React.FC<MusicPlayerSheetProps> = ({
 
   const [showNewListForm, setShowNewListForm] = useState(false);
   const [newListName, setNewListName] = useState('');
+  const [multiAddListId, setMultiAddListId] = useState<string | null>(null);
+  const [multiAddSelectedIds, setMultiAddSelectedIds] = useState<string[]>([]);
+  const [multiAddQuery, setMultiAddQuery] = useState('');
+  const [multiAddBusy, setMultiAddBusy] = useState(false);
 
   const [openMenuTrackId, setOpenMenuTrackId] = useState<string | null>(null);
   const [renamingTrackId, setRenamingTrackId] = useState<string | null>(null);
@@ -195,6 +204,17 @@ export const MusicPlayerSheet: React.FC<MusicPlayerSheetProps> = ({
   const [busyImport, setBusyImport] = useState(false);
   const [isDraggingVolume, setIsDraggingVolume] = useState(false);
   const [isCompactSticky, setIsCompactSticky] = useState(false);
+  const [isPageHidden, setIsPageHidden] = useState(() =>
+    typeof document !== 'undefined' ? document.visibilityState === 'hidden' : false
+  );
+
+  useEffect(() => {
+    if (!open) return;
+    const onVis = () => setIsPageHidden(document.visibilityState === 'hidden');
+    onVis();
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, [open]);
 
   // Swipe-down to dismiss sheet from header handle
   const swipeStartYRef = useRef<number | null>(null);
@@ -218,12 +238,21 @@ export const MusicPlayerSheet: React.FC<MusicPlayerSheetProps> = ({
   }, [activeTab, lists]);
 
   useEffect(() => {
+    setMultiAddListId(null);
+    setMultiAddSelectedIds([]);
+    setMultiAddQuery('');
+  }, [activeTab]);
+
+  useEffect(() => {
     if (!open) {
       setSwipeOffsetY(0);
       swipeStartYRef.current = null;
       setShowHeaderMenu(false);
       setOpenMenuTrackId(null);
       setIsCompactSticky(false);
+      setMultiAddListId(null);
+      setMultiAddSelectedIds([]);
+      setMultiAddQuery('');
     }
   }, [open]);
 
@@ -357,10 +386,16 @@ export const MusicPlayerSheet: React.FC<MusicPlayerSheetProps> = ({
       return;
     }
     setRadioError(null);
-    await onAddRadio(radioTitle.trim() || 'إذاعة مباشرة', radioUrl.trim());
-    setRadioTitle('');
-    setRadioUrl('');
-    setShowRadioForm(false);
+    try {
+      await onAddRadio(radioTitle.trim() || 'إذاعة مباشرة', radioUrl.trim());
+      setRadioTitle('');
+      setRadioUrl('');
+      setShowRadioForm(false);
+    } catch (err) {
+      setRadioError(
+        err instanceof Error && err.message ? err.message : 'تعذر إضافة الإذاعة'
+      );
+    }
   };
 
   const handleStartRename = (track: MusicTrackRecord) => {
@@ -410,13 +445,15 @@ export const MusicPlayerSheet: React.FC<MusicPlayerSheetProps> = ({
             ? { transform: `translateY(${swipeOffsetY}px)` }
             : undefined
         }
-        className="w-full max-w-2xl h-[78dvh] min-h-[360px] max-h-[90dvh] bg-[#F7F8FA] dark:bg-slate-950 rounded-t-3xl border-t border-slate-200/80 dark:border-slate-800 shadow-2xl flex flex-col overflow-hidden pb-[env(safe-area-inset-bottom,0px)] transition-transform duration-150"
+        className={`w-full max-w-2xl h-[78dvh] min-h-[360px] max-h-[90dvh] bg-[#F7F8FA] dark:bg-slate-950 rounded-t-3xl border-t border-slate-200/80 dark:border-slate-800 shadow-2xl flex flex-col overflow-hidden pb-[env(safe-area-inset-bottom,0px)] transition-transform duration-150 ${
+          batterySaverOn || isPageHidden ? 'music-animations-paused' : ''
+        }`}
       >
         {/* Hidden inputs for reattach audio & custom cover */}
         <input
           ref={reattachInputRef}
           type="file"
-          accept="audio/*,.mp3,.m4a,.mp4,.aac,.ogg,.opus,.wav,.flac,.webm,video/mp4,video/webm"
+          accept={AUDIO_PICKER_ACCEPT}
           onChange={handleReattachSelected}
           className="hidden"
         />
@@ -1083,20 +1120,35 @@ export const MusicPlayerSheet: React.FC<MusicPlayerSheetProps> = ({
                   </form>
                 )}
 
-                {/* Active Custom List Header Banner (option to delete list) */}
+                {/* Active Custom List Header Banner (multi-add tracks + delete list) */}
                 {activeListObj && (
                   <div className="px-3 py-2 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between gap-2 bg-emerald-50/50 dark:bg-emerald-950/20 text-xs">
-                    <span className="font-extrabold text-emerald-800 dark:text-emerald-300">
+                    <span className="font-extrabold text-emerald-800 dark:text-emerald-300 truncate">
                       قائمة: {activeListObj.name} ({filteredTracks.length})
                     </span>
-                    <button
-                      type="button"
-                      onClick={() => void onDeleteList(activeListObj.id)}
-                      className="px-2.5 py-1 rounded-lg text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 font-bold flex items-center gap-1"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                      <span>حذف القائمة</span>
-                    </button>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        type="button"
+                        data-testid="music-list-multi-add-btn"
+                        onClick={() => {
+                          setMultiAddListId(activeListObj.id);
+                          setMultiAddSelectedIds([]);
+                          setMultiAddQuery('');
+                        }}
+                        className="min-h-[34px] px-2.5 py-1 rounded-lg bg-emerald-500 text-white font-extrabold flex items-center gap-1 active:scale-95 transition"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        <span>إضافة مقاطع</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void onDeleteList(activeListObj.id)}
+                        className="min-h-[34px] px-2.5 py-1 rounded-lg text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 font-bold flex items-center gap-1"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <span>حذف القائمة</span>
+                      </button>
+                    </div>
                   </div>
                 )}
 
@@ -1129,16 +1181,32 @@ export const MusicPlayerSheet: React.FC<MusicPlayerSheetProps> = ({
 
                 {/* Track Rows */}
                 {filteredTracks.length === 0 ? (
-                  <div className="p-6 text-center text-xs font-bold text-slate-400 dark:text-slate-500">
-                    {searchQuery
-                      ? 'لا توجد مقاطع مطابقة للبحث.'
-                      : activeTab === 'favorites'
-                      ? 'لا توجد مقاطع في المفضلة بعد. اضغط على النجمة بجانب أي مقطع.'
-                      : activeTab === 'recent'
-                      ? 'لم يتم تشغيل أي مقطع مؤخراً.'
-                      : activeListObj
-                      ? 'هذه القائمة فارغة. افتح «⋯» على أي مقطع لإضافته هنا.'
-                      : 'القائمة فارغة.'}
+                  <div className="p-6 text-center text-xs font-bold text-slate-400 dark:text-slate-500 space-y-3">
+                    <div>
+                      {searchQuery
+                        ? 'لا توجد مقاطع مطابقة للبحث.'
+                        : activeTab === 'favorites'
+                        ? 'لا توجد مقاطع في المفضلة بعد. اضغط على النجمة بجانب أي مقطع.'
+                        : activeTab === 'recent'
+                        ? 'لم يتم تشغيل أي مقطع مؤخراً.'
+                        : activeListObj
+                        ? 'هذه القائمة فارغة. يمكنك تحديد عدة مقاطع لإضافتها دفعة واحدة.'
+                        : 'القائمة فارغة.'}
+                    </div>
+                    {activeListObj && !searchQuery && tracks.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setMultiAddListId(activeListObj.id);
+                          setMultiAddSelectedIds([]);
+                          setMultiAddQuery('');
+                        }}
+                        className="min-h-[40px] px-4 rounded-xl bg-emerald-500 text-white text-xs font-extrabold inline-flex items-center gap-1.5 shadow-sm active:scale-95 transition"
+                      >
+                        <Plus className="w-4 h-4" />
+                        <span>إضافة مقاطع إلى القائمة</span>
+                      </button>
+                    )}
                   </div>
                 ) : (
                   <div className="divide-y divide-slate-100 dark:divide-slate-800">
@@ -1306,7 +1374,7 @@ export const MusicPlayerSheet: React.FC<MusicPlayerSheetProps> = ({
                               >
                                 {isCurrent ? (
                                   <MusicEqualizer
-                                    active={isPlaying}
+                                    active={isPlaying && !batterySaverOn && !isPageHidden}
                                     className="text-white"
                                   />
                                 ) : (
@@ -1673,6 +1741,222 @@ export const MusicPlayerSheet: React.FC<MusicPlayerSheetProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Custom List Multi-Add Modal */}
+      {multiAddListId && (() => {
+        const targetList = lists.find((l) => l.id === multiAddListId);
+        const qNorm = multiAddQuery.trim().toLowerCase();
+        const modalTracks = qNorm
+          ? tracks.filter(
+              (t) =>
+                t.title.toLowerCase().includes(qNorm) ||
+                (t.fileName || '').toLowerCase().includes(qNorm)
+            )
+          : tracks;
+        const availableIds = modalTracks
+          .filter((t) => !(Array.isArray(t.listIds) && t.listIds.includes(multiAddListId)))
+          .map((t) => t.id);
+
+        const handleToggleCandidate = (trackId: string) => {
+          setMultiAddSelectedIds((prev) =>
+            prev.includes(trackId)
+              ? prev.filter((id) => id !== trackId)
+              : [...prev, trackId]
+          );
+        };
+
+        const handleConfirmMultiAdd = async () => {
+          if (multiAddSelectedIds.length === 0 || multiAddBusy) return;
+          setMultiAddBusy(true);
+          try {
+            if (onAddTracksToList) {
+              await onAddTracksToList(multiAddListId, multiAddSelectedIds);
+            } else {
+              for (const id of multiAddSelectedIds) {
+                const tr = tracks.find((t) => t.id === id);
+                if (!tr?.listIds?.includes(multiAddListId)) {
+                  await onToggleTrackInList(id, multiAddListId);
+                }
+              }
+            }
+            setMultiAddListId(null);
+            setMultiAddSelectedIds([]);
+            setMultiAddQuery('');
+          } finally {
+            setMultiAddBusy(false);
+          }
+        };
+
+        return (
+          <div
+            data-testid="music-list-multi-add-modal"
+            className="fixed inset-0 z-[70] bg-black/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4"
+            onClick={(e) => {
+              e.stopPropagation();
+              setMultiAddListId(null);
+            }}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="w-full max-w-lg max-h-[82dvh] bg-white dark:bg-slate-900 rounded-t-3xl sm:rounded-3xl border border-slate-200 dark:border-slate-700 shadow-2xl flex flex-col overflow-hidden"
+            >
+              <div className="px-4 py-3.5 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <h3 className="text-sm font-extrabold text-slate-900 dark:text-white truncate">
+                    إضافة مقاطع إلى: {targetList?.name || 'القائمة'}
+                  </h3>
+                  <p className="text-[11px] font-bold text-slate-500 dark:text-slate-400">
+                    حدد المقاطع من مكتبتك (المقاطع المضافة مسبقاً محمية من التكرار)
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setMultiAddListId(null)}
+                  aria-label="إغلاق نافذة إضافة المقاطع"
+                  className="min-w-[40px] min-h-[40px] rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 flex items-center justify-center shrink-0"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {tracks.length > 0 && (
+                <div className="px-4 py-2.5 border-b border-slate-100 dark:border-slate-800 flex items-center gap-2">
+                  <div className="relative flex-1 min-w-0">
+                    <Search className="w-4 h-4 text-slate-400 absolute right-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={multiAddQuery}
+                      onChange={(e) => setMultiAddQuery(e.target.value)}
+                      placeholder="ابحث عن مقطع…"
+                      className="w-full min-h-[40px] pr-9 pl-3 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs font-bold text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                    />
+                  </div>
+                  {availableIds.length > 0 && (
+                    <button
+                      type="button"
+                      data-testid="music-multi-add-select-all"
+                      onClick={() =>
+                        setMultiAddSelectedIds((prev) =>
+                          prev.length === availableIds.length ? [] : availableIds
+                        )
+                      }
+                      className="min-h-[40px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-[11px] font-extrabold shrink-0"
+                    >
+                      {multiAddSelectedIds.length === availableIds.length
+                        ? 'إلغاء التحديد'
+                        : 'تحديد المتاح'}
+                    </button>
+                  )}
+                </div>
+              )}
+
+              <div className="flex-1 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800">
+                {tracks.length === 0 ? (
+                  <div className="p-6 text-center space-y-3">
+                    <div className="text-xs font-bold text-slate-500 dark:text-slate-400">
+                      لا توجد مقاطع في المكتبة الصوتية بعد.
+                    </div>
+                    <MusicAudioImporterTrigger
+                      variant="empty-primary"
+                      buttonText="إضافة ملفات صوتية"
+                      disabled={busyImport || Boolean(importProgress)}
+                      onSelectFiles={onAddFiles}
+                      showSavedNote={false}
+                    />
+                  </div>
+                ) : modalTracks.length === 0 ? (
+                  <div className="p-6 text-center text-xs font-bold text-slate-400">
+                    لا توجد مقاطع مطابقة للبحث.
+                  </div>
+                ) : (
+                  modalTracks.map((tr, idx) => {
+                    const alreadyAdded =
+                      Array.isArray(tr.listIds) &&
+                      tr.listIds.includes(multiAddListId);
+                    const checked =
+                      alreadyAdded || multiAddSelectedIds.includes(tr.id);
+
+                    return (
+                      <button
+                        key={tr.id}
+                        type="button"
+                        disabled={alreadyAdded}
+                        data-testid={`music-multi-add-row-${idx}`}
+                        onClick={() => handleToggleCandidate(tr.id)}
+                        className={`w-full px-4 py-2.5 flex items-center gap-3 text-right transition ${
+                          alreadyAdded
+                            ? 'opacity-65 cursor-not-allowed bg-slate-50/70 dark:bg-slate-800/30'
+                            : checked
+                            ? 'bg-emerald-50/70 dark:bg-emerald-950/30'
+                            : 'hover:bg-slate-50 dark:hover:bg-slate-800/40'
+                        }`}
+                      >
+                        <span
+                          className={`w-5 h-5 rounded-md flex items-center justify-center border shrink-0 ${
+                            checked
+                              ? 'bg-emerald-500 border-emerald-500 text-white'
+                              : 'border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900'
+                          }`}
+                        >
+                          {checked && <Check className="w-3.5 h-3.5" />}
+                        </span>
+                        <TrackCoverTile
+                          track={tr}
+                          sizeClass="w-10 h-10"
+                          textClass="text-sm"
+                          roundedClass="rounded-xl"
+                        />
+                        <div className="flex-1 min-w-0">
+                          <div
+                            dir="auto"
+                            className="text-xs font-extrabold text-slate-900 dark:text-white truncate"
+                          >
+                            {tr.title}
+                          </div>
+                          {tr.fileName && tr.fileName !== tr.title && (
+                            <div
+                              dir="auto"
+                              className="text-[11px] font-semibold text-slate-400 truncate"
+                            >
+                              {tr.fileName}
+                            </div>
+                          )}
+                        </div>
+                        {alreadyAdded && (
+                          <span className="px-2 py-0.5 rounded-full bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-200 text-[10px] font-extrabold shrink-0">
+                            مضاف مسبقاً
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+
+              {tracks.length > 0 && (
+                <div className="p-3.5 border-t border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setMultiAddListId(null)}
+                    className="min-h-[44px] flex-1 rounded-xl bg-slate-200 dark:bg-slate-800 text-slate-800 dark:text-slate-200 text-xs font-extrabold"
+                  >
+                    إلغاء
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="music-list-multi-add-submit"
+                    disabled={multiAddSelectedIds.length === 0 || multiAddBusy}
+                    onClick={() => void handleConfirmMultiAdd()}
+                    className="min-h-[44px] flex-1 rounded-xl bg-emerald-500 text-white text-xs font-extrabold disabled:opacity-45"
+                  >
+                    إضافة المحدد ({multiAddSelectedIds.length})
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Diagnostics Modal */}
       <MusicDiagnosticsModal

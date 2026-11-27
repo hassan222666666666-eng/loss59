@@ -371,7 +371,8 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
                     .map((l) => l.trim())
                     .find(Boolean) || '';
                 const dateLabel = formatDayHeading(getLocalDateKey(note.updatedAt));
-                const firstPhoto = note.photos?.[0]?.dataUrl;
+                const firstPhoto =
+                  note.photos?.[0]?.thumbnailDataUrl || note.photos?.[0]?.dataUrl;
 
                 const isSelected = selectedNoteIds.has(note.id);
                 const cardButton = (
@@ -428,6 +429,8 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
                       <img
                         src={firstPhoto}
                         alt="معاينة الملاحظة"
+                        decoding="async"
+                        loading="lazy"
                         className="w-16 h-16 rounded-xl object-cover shrink-0 bg-slate-100 dark:bg-slate-800"
                       />
                     )}
@@ -511,6 +514,9 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
           includeTotalInWhatsApp={Boolean(settings.includeTotalInWhatsApp)}
           defaultNoteNumbering={Boolean(settings.defaultNoteNumbering)}
           defaultNoteQuantities={settings.defaultNoteQuantities !== false}
+          autoTakeNoteNumber={Boolean(settings.autoTakeNoteNumber)}
+          noteUnitMode={settings.noteUnitMode === 'fixed' ? 'fixed' : 'per-product'}
+          noteDefaultUnit={settings.noteDefaultUnit || 'none'}
           noteCopySortOrder={settings.noteCopySortOrder || 'as-written'}
           noteCopyDigitStyle={settings.noteCopyDigitStyle || 'western'}
           noteCopyIncludeTotalQuantities={Boolean(

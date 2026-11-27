@@ -17,7 +17,21 @@ import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { useMusicPlayer } from './modules/music/useMusicPlayer';
 import { MusicFloatingButton } from './modules/music/MusicFloatingButton';
 import { MusicPlayerSheet } from './modules/music/MusicPlayerSheet';
-import { CheckCircle2, X } from 'lucide-react';
+import {
+  resumePendingPhotoEnhancements,
+  subscribeEnhancementUpdates,
+} from './modules/camera/photoEnhancementQueue';
+import {
+  setBatterySaverActive,
+  setCaptureTabActive,
+  subscribeBatchPhotoFlushed,
+} from './modules/camera/backgroundCameraQueue';
+import { useBatterySaver } from './modules/power/useBatterySaver';
+import {
+  triggerWaitingServiceWorkerReload,
+  useOfflineSWStatus,
+} from './pwa/registerOfflineSW';
+import { CheckCircle2, RefreshCw, X } from 'lucide-react';
 
 function hasActiveBlockingOverlay(): boolean {
   if (typeof document === 'undefined') return false;
@@ -48,6 +62,10 @@ export function App() {
   const [isNotesKeyboardOpen, setIsNotesKeyboardOpen] = useState(false);
   const [hasBlockingOverlay, setHasBlockingOverlay] = useState(false);
   const [showLegacyCleanupBanner, setShowLegacyCleanupBanner] = useState(false);
+  const [updateToastDismissed, setUpdateToastDismissed] = useState(false);
+
+  const swStatus = useOfflineSWStatus();
+  const batterySaver = useBatterySaver(settings.batterySaverMode);
 
   const music = useMusicPlayer({
     enabled: settings.musicPlayerEnabled,
@@ -55,7 +73,16 @@ export function App() {
     refreshSignal,
     visualEffects: settings.musicVisualEffects,
     audioReactive: settings.musicAudioReactive,
+    pauseReactiveSampling: activeTab === 'capture' || batterySaver.isBatterySaverOn,
   });
+
+  useEffect(() => {
+    setCaptureTabActive(activeTab === 'capture');
+  }, [activeTab]);
+
+  useEffect(() => {
+    setBatterySaverActive(batterySaver.isBatterySaverOn);
+  }, [batterySaver.isBatterySaverOn]);
 
   // Track any fullscreen viewer, modal, or bottom sheet to hide the floating button automatically
   useEffect(() => {
@@ -146,14 +173,24 @@ export function App() {
         const s = await getSettings();
         setSettings(s);
         if (s.autoDeletePhotos) {
-          cleanupExpiredDonePhotos(s.keepPhotosDays).catch(() => {});
+          await cleanupExpiredDonePhotos(s.keepPhotosDays).catch(() => {});
         }
+        void resumePendingPhotoEnhancements(s);
       } catch {
         // Keep defaults
       }
     })();
 
+    const unsubscribeEnhancements = subscribeEnhancementUpdates(() => {
+      setRefreshSignal((v) => v + 1);
+    });
+    const unsubscribeBatchWrites = subscribeBatchPhotoFlushed(() => {
+      setRefreshSignal((v) => v + 1);
+    });
+
     return () => {
+      unsubscribeEnhancements();
+      unsubscribeBatchWrites();
       if (bannerTimer !== null) {
         window.clearTimeout(bannerTimer);
       }
@@ -166,12 +203,9 @@ export function App() {
 
   const handleUpdateSettings = useCallback(
     async (partial: Partial<AppSettings>) => {
+      setSettings((prev) => ({ ...prev, ...partial }));
       const next = await saveSettings(partial);
       setSettings(next);
-
-      if (next.autoDeletePhotos) {
-        await cleanupExpiredDonePhotos(next.keepPhotosDays).catch(() => {});
-      }
       setRefreshSignal((v) => v + 1);
     },
     []
@@ -244,11 +278,40 @@ export function App() {
         </div>
       )}
 
+      {/* Non-blocking PWA waiting-update toast */}
+      {swStatus.updateAvailable && !updateToastDismissed && (
+        <div
+          data-testid="pwa-update-toast"
+          role="status"
+          className="fixed top-[max(12px,env(safe-area-inset-top,0px))] inset-x-4 z-[60] flex justify-center pointer-events-none"
+        >
+          <div className="pointer-events-auto max-w-md w-full px-3.5 py-2.5 rounded-2xl shadow-xl bg-slate-900/95 text-white border border-emerald-500/40 text-xs font-extrabold flex items-center justify-between gap-2 backdrop-blur-md">
+            <button
+              type="button"
+              onClick={() => triggerWaitingServiceWorkerReload()}
+              className="flex items-center gap-2 text-right flex-1 min-w-0"
+            >
+              <RefreshCw className="w-4 h-4 text-emerald-400 shrink-0" />
+              <span className="truncate">يوجد تحديث · أعد فتح التطبيق</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setUpdateToastDismissed(true)}
+              aria-label="إغلاق إشعار التحديث"
+              className="w-7 h-7 rounded-lg bg-white/15 flex items-center justify-center shrink-0"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {activeTab === 'capture' && (
         <CameraScreen
           sessionId={sessionId}
           settings={settings}
           isOnline={isOnline}
+          isBatterySaverOn={batterySaver.isBatterySaverOn}
           onPhotoQueued={handlePhotoSaved}
           onOpenPhotoInLog={handleOpenPhotoInLog}
           onUpdateSettings={handleUpdateSettings}
@@ -257,6 +320,7 @@ export function App() {
 
       {activeTab === 'log' && (
         <LogScreen
+          settings={settings}
           refreshSignal={refreshSignal}
           focusPhotoId={focusLogPhotoId}
           onClearFocusPhoto={() => setFocusLogPhotoId(null)}
@@ -277,7 +341,10 @@ export function App() {
           settings={settings}
           isOnline={isOnline}
           refreshSignal={refreshSignal}
+          batterySaverState={batterySaver}
           musicStorageStats={music.storageStats}
+          musicVolume={music.volume}
+          musicMuted={music.isMuted}
           musicImportProgress={music.importProgress}
           musicImportReport={music.importReport}
           audioReactiveWarning={music.audioReactiveWarning}
@@ -285,6 +352,8 @@ export function App() {
           onCancelMusicImport={music.cancelImport}
           onDismissMusicImportReport={music.dismissImportReport}
           onOpenMusicPlayer={() => music.setIsSheetOpen(true)}
+          onResetMusicVolume={music.resetVolume}
+          onGetMusicDiagnostics={music.getDiagnosticsSnapshot}
           onClearMusicLibrary={music.clearLibrary}
           onUpdateSettings={handleUpdateSettings}
           onDataChanged={handleDataChanged}
@@ -301,6 +370,7 @@ export function App() {
           sleepRemainingSec={music.sleepRemainingSec}
           colorPresetId={settings.musicFabColor}
           visualEffects={settings.musicVisualEffects}
+          disableEffects={activeTab === 'capture' || batterySaver.isBatterySaverOn}
           reactiveLevels={music.reactiveLevels}
           onTapOpen={() => music.setIsSheetOpen(true)}
           onLongPressTogglePlay={() => void music.togglePlayPause()}
@@ -352,11 +422,13 @@ export function App() {
           onUpdateTrackCover={music.updateTrackCover}
           onSetTrackTileColor={music.setTrackTileColor}
           onToggleTrackInList={music.toggleTrackInList}
+          onAddTracksToList={music.addTracksToList}
           onCreateList={music.createList}
           onDeleteList={music.deleteList}
           onReorderTrack={music.reorderTrack}
           onDeleteTrack={music.deleteTrack}
           onGetDiagnostics={music.getDiagnosticsSnapshot}
+          batterySaverOn={batterySaver.isBatterySaverOn}
         />
       )}
 

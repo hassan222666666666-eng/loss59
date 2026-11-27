@@ -147,6 +147,7 @@
   will-change: transform, opacity;
 }
 
+.music-animations-paused .music-marquee-track,
 .music-animations-paused .music-eq-bar,
 .music-animations-paused .music-fab-spin-border,
 .music-animations-paused .music-fab-pulse-ring,

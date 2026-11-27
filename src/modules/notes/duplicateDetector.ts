@@ -768,6 +768,7 @@ export function mergeDuplicateLines(params: {
   linePhotos: NoteLinePhoto[];
   lineQuantities: NoteLineQuantity[];
   mergedQuantity: number | null;
+  unitMismatch?: boolean;
 } {
   const oldLines = params.body.split('\n');
   const { keepIndex } = params;
@@ -777,6 +778,7 @@ export function mergeDuplicateLines(params: {
       linePhotos: params.linePhotos,
       lineQuantities: params.lineQuantities,
       mergedQuantity: null,
+      unitMismatch: false,
     };
   }
 
@@ -794,6 +796,7 @@ export function mergeDuplicateLines(params: {
       linePhotos: params.linePhotos,
       lineQuantities: params.lineQuantities,
       mergedQuantity: existingQty,
+      unitMismatch: false,
     };
   }
 
@@ -806,6 +809,23 @@ export function mergeDuplicateLines(params: {
         ...(q.unit ? { unit: q.unit } : {}),
       });
     }
+  }
+
+  const explicitUnits = new Set<NonNullable<NoteLineQuantity['unit']>>();
+  for (const idx of groupIndices) {
+    const entry = qtyByLine.get(idx);
+    if (entry && entry.quantity > 0 && entry.unit) {
+      explicitUnits.add(entry.unit);
+    }
+  }
+  if (explicitUnits.size > 1) {
+    return {
+      body: params.body,
+      linePhotos: params.linePhotos,
+      lineQuantities: params.lineQuantities,
+      mergedQuantity: null,
+      unitMismatch: true,
+    };
   }
 
   let hasAnyQty = false;
@@ -897,5 +917,6 @@ export function mergeDuplicateLines(params: {
     linePhotos: nextPhotos,
     lineQuantities: nextQuantities,
     mergedQuantity,
+    unitMismatch: false,
   };
 }

@@ -29,11 +29,13 @@ import {
   AppSettings,
   NoteCopyDigitStyle,
   NoteCopySortOrder,
+  NoteDefaultUnit,
   NoteItem,
   NoteLinePhoto,
   NoteLineQuantity,
   NotePhoto,
   NoteQuantityUnit,
+  NoteUnitMode,
 } from '../../types';
 import { compressCanvasToJpeg, fileOrDataUrlToCanvas } from '../camera/imageCompression';
 import { useVisualViewport } from '../../hooks/useVisualViewport';
@@ -65,20 +67,32 @@ import {
   scanNoteDuplicates,
 } from './duplicateDetector';
 import {
+  NOTE_QUANTITY_UNIT_OPTIONS,
   computeNoteQuantitiesSummary,
   computeToolbarVisibleCount,
+  extractAutoTakeQuantityAndUnit,
   formatQuantityNumber,
   formatQuantityUnitLabel,
   parseQuantityNumberInput,
   realignLineQuantitiesAfterEdit,
   roundQuantityValue,
 } from './quantityLogic';
+import {
+  forgetUnitForProduct,
+  loadProductUnitMemory,
+  rememberUnitForProduct,
+  resolveQuantityUnit,
+} from './unitMemory';
+import { NoteSettingsSheet } from './NoteSettingsSheet';
 
 interface NoteEditorViewProps {
   note: NoteItem;
   includeTotalInWhatsApp: boolean;
   defaultNoteNumbering?: boolean;
   defaultNoteQuantities?: boolean;
+  autoTakeNoteNumber?: boolean;
+  noteUnitMode?: NoteUnitMode;
+  noteDefaultUnit?: NoteDefaultUnit;
   noteCopySortOrder?: NoteCopySortOrder;
   noteCopyDigitStyle?: NoteCopyDigitStyle;
   noteCopyIncludeTotalQuantities?: boolean;
@@ -106,6 +120,9 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
   includeTotalInWhatsApp,
   defaultNoteNumbering = false,
   defaultNoteQuantities = true,
+  autoTakeNoteNumber = false,
+  noteUnitMode = 'per-product',
+  noteDefaultUnit = 'none',
   noteCopySortOrder = 'as-written',
   noteCopyDigitStyle = 'western',
   noteCopyIncludeTotalQuantities = false,
@@ -144,11 +161,9 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
   const [copiedNote, setCopiedNote] = useState(false);
   const [showCalcSheet, setShowCalcSheet] = useState(false);
   const [showWhatsAppSheet, setShowWhatsAppSheet] = useState(false);
-  const [showWhatsAppMoreMenu, setShowWhatsAppMoreMenu] = useState(false);
   const [showToolbarMoreMenu, setShowToolbarMoreMenu] = useState(false);
   const [showPhotoSourceMenu, setShowPhotoSourceMenu] = useState(false);
   const [showCopyPreviewSheet, setShowCopyPreviewSheet] = useState(false);
-  const [showCopyFormatSheet, setShowCopyFormatSheet] = useState(false);
   const [showNoteSettingsSheet, setShowNoteSettingsSheet] = useState(false);
   const [activeQtyLineIndex, setActiveQtyLineIndex] = useState<number | null>(
     null
@@ -157,7 +172,10 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
   const activeQtyLineRef = useRef<number | null>(null);
   const qtyDraftRef = useRef('');
   const [shareFeedback, setShareFeedback] = useState<string | null>(null);
+  const [topUnitNotice, setTopUnitNotice] = useState<string | null>(null);
+  const topUnitNoticeTimerRef = useRef<number | null>(null);
   const [showDuplicateCheckSheet, setShowDuplicateCheckSheet] = useState(false);
+  const [unitMismatchGroupIds, setUnitMismatchGroupIds] = useState<string[]>([]);
   const [calcState, setCalcState] = useState<CalculatorState>({
     expression: '',
     justEvaluated: false,
@@ -184,6 +202,25 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
     label: string;
   } | null>(null);
   const duplicateUndoTimerRef = useRef<number | null>(null);
+
+  // Non-blocking inline auto-take feedback: 0.5s box highlight + 4s tiny undo icon beside that box
+  const [highlightedQtyLineIndex, setHighlightedQtyLineIndex] = useState<
+    number | null
+  >(null);
+  const highlightQtyTimerRef = useRef<number | null>(null);
+  const [autoTakeUndo, setAutoTakeUndo] = useState<{
+    lineIndex: number;
+    previousBody: string;
+    previousLinePhotos: NoteLinePhoto[];
+    previousLineQuantities: NoteLineQuantity[];
+    fading: boolean;
+  } | null>(null);
+  const autoTakeUndoFadeTimerRef = useRef<number | null>(null);
+  const autoTakeUndoClearTimerRef = useRef<number | null>(null);
+
+  // Long-press handling on "نسخ" button -> opens "معاينة النسخ"
+  const copyLongPressTimerRef = useRef<number | null>(null);
+  const copyLongPressTriggeredRef = useRef(false);
 
   // Side-picture slot menu (Camera & Gallery only)
   const [menuLineIndex, setMenuLineIndex] = useState<number | null>(null);
@@ -226,6 +263,12 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
   rawLinesRef.current = body.split('\n');
   const quantitiesEnabledRef = useRef(quantitiesEnabled);
   quantitiesEnabledRef.current = quantitiesEnabled;
+  const autoTakeNoteNumberRef = useRef(autoTakeNoteNumber);
+  autoTakeNoteNumberRef.current = autoTakeNoteNumber;
+  const noteUnitModeRef = useRef<NoteUnitMode>(noteUnitMode);
+  noteUnitModeRef.current = noteUnitMode;
+  const noteDefaultUnitRef = useRef<NoteDefaultUnit>(noteDefaultUnit);
+  noteDefaultUnitRef.current = noteDefaultUnit;
   const lineQuantitiesRef = useRef<NoteLineQuantity[]>(lineQuantities);
   lineQuantitiesRef.current = lineQuantities;
   const linePhotosRef = useRef<NoteLinePhoto[]>(linePhotos);
@@ -244,6 +287,21 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
       onKeyboardOpenChange?.(false);
       if (duplicateUndoTimerRef.current !== null) {
         window.clearTimeout(duplicateUndoTimerRef.current);
+      }
+      if (topUnitNoticeTimerRef.current !== null) {
+        window.clearTimeout(topUnitNoticeTimerRef.current);
+      }
+      if (highlightQtyTimerRef.current !== null) {
+        window.clearTimeout(highlightQtyTimerRef.current);
+      }
+      if (autoTakeUndoFadeTimerRef.current !== null) {
+        window.clearTimeout(autoTakeUndoFadeTimerRef.current);
+      }
+      if (autoTakeUndoClearTimerRef.current !== null) {
+        window.clearTimeout(autoTakeUndoClearTimerRef.current);
+      }
+      if (copyLongPressTimerRef.current !== null) {
+        window.clearTimeout(copyLongPressTimerRef.current);
       }
     };
   }, [onKeyboardOpenChange]);
@@ -439,6 +497,98 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
     [scrollCaretOrLineIntoView]
   );
 
+  const showTopUnitNotice = useCallback(
+    (message: string, durationMs: number = 2200) => {
+      if (topUnitNoticeTimerRef.current !== null) {
+        window.clearTimeout(topUnitNoticeTimerRef.current);
+      }
+      setTopUnitNotice(message);
+      topUnitNoticeTimerRef.current = window.setTimeout(() => {
+        setTopUnitNotice(null);
+        topUnitNoticeTimerRef.current = null;
+      }, durationMs);
+    },
+    []
+  );
+
+  const clearAutoTakeTimers = useCallback(() => {
+    if (highlightQtyTimerRef.current !== null) {
+      window.clearTimeout(highlightQtyTimerRef.current);
+      highlightQtyTimerRef.current = null;
+    }
+    if (autoTakeUndoFadeTimerRef.current !== null) {
+      window.clearTimeout(autoTakeUndoFadeTimerRef.current);
+      autoTakeUndoFadeTimerRef.current = null;
+    }
+    if (autoTakeUndoClearTimerRef.current !== null) {
+      window.clearTimeout(autoTakeUndoClearTimerRef.current);
+      autoTakeUndoClearTimerRef.current = null;
+    }
+  }, []);
+
+  const triggerAutoTakeFeedback = useCallback(
+    (
+      lineIndex: number,
+      previousBody: string,
+      previousLinePhotos: NoteLinePhoto[],
+      previousLineQuantities: NoteLineQuantity[]
+    ) => {
+      clearAutoTakeTimers();
+      setHighlightedQtyLineIndex(lineIndex);
+      setAutoTakeUndo({
+        lineIndex,
+        previousBody,
+        previousLinePhotos,
+        previousLineQuantities,
+        fading: false,
+      });
+      highlightQtyTimerRef.current = window.setTimeout(() => {
+        setHighlightedQtyLineIndex(null);
+        highlightQtyTimerRef.current = null;
+      }, 520);
+      autoTakeUndoFadeTimerRef.current = window.setTimeout(() => {
+        setAutoTakeUndo((prev) => (prev ? { ...prev, fading: true } : null));
+        autoTakeUndoFadeTimerRef.current = null;
+      }, 3650);
+      autoTakeUndoClearTimerRef.current = window.setTimeout(() => {
+        setAutoTakeUndo(null);
+        autoTakeUndoClearTimerRef.current = null;
+      }, 4000);
+    },
+    [clearAutoTakeTimers]
+  );
+
+  const handleUndoAutoTake = useCallback(() => {
+    if (!autoTakeUndo) return;
+    clearAutoTakeTimers();
+    const targetIdx = autoTakeUndo.lineIndex;
+    const restoredBody = autoTakeUndo.previousBody;
+    const restoredPhotos = autoTakeUndo.previousLinePhotos;
+    const restoredQuantities = autoTakeUndo.previousLineQuantities;
+    const restoredLineCount = restoredBody.split('\n').length;
+
+    bodyRef.current = restoredBody;
+    linePhotosRef.current = restoredPhotos;
+    lineQuantitiesRef.current = restoredQuantities;
+    flushSync(() => {
+      setBody(restoredBody);
+      setLinePhotos(restoredPhotos);
+      setLineQuantities(restoredQuantities);
+      setAutoTakeUndo(null);
+      setHighlightedQtyLineIndex(null);
+    });
+
+    const focusIdx = Math.min(targetIdx, Math.max(0, restoredLineCount - 1));
+    focusedNumberedLineRef.current = focusIdx;
+    activeLineIndexRef.current = focusIdx;
+    const el = lineInputRefs.current[focusIdx];
+    if (el) {
+      el.focus();
+      const len = el.value.length;
+      el.setSelectionRange(len, len);
+    }
+  }, [autoTakeUndo, clearAutoTakeTimers]);
+
   const showUndoBannerFor5Seconds = useCallback(
     (
       previousBody: string,
@@ -485,6 +635,76 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
     ].sort((a, b) => a.lineIndex - b.lineIndex);
   };
 
+  const applyAutoTakeOnLineFinish = useCallback(
+    (
+      lineIdx: number,
+      options?: { overrideLineText?: string }
+    ): { extracted: boolean; cleanName: string } => {
+      if (!quantitiesEnabledRef.current || !autoTakeNoteNumberRef.current) {
+        const lines = bodyRef.current.split('\n');
+        return {
+          extracted: false,
+          cleanName: options?.overrideLineText ?? lines[lineIdx] ?? '',
+        };
+      }
+      const prevBody = bodyRef.current;
+      const lines = prevBody.split('\n');
+      if (lineIdx < 0 || lineIdx >= lines.length) {
+        return { extracted: false, cleanName: '' };
+      }
+      const rawLine = options?.overrideLineText ?? lines[lineIdx];
+      const extracted = extractAutoTakeQuantityAndUnit(rawLine);
+      if (!extracted) {
+        return { extracted: false, cleanName: rawLine };
+      }
+
+      const prevLinePhotos = linePhotosRef.current;
+      const prevLineQuantities = lineQuantitiesRef.current;
+
+      const resolvedUnit = resolveQuantityUnit({
+        explicitUnit: extracted.unit,
+        productName: extracted.cleanName,
+        unitMode: noteUnitModeRef.current,
+        defaultUnit: noteDefaultUnitRef.current,
+        memory: loadProductUnitMemory(),
+      });
+
+      if (extracted.unit && noteUnitModeRef.current !== 'fixed') {
+        rememberUnitForProduct(extracted.cleanName, extracted.unit);
+      }
+
+      lines[lineIdx] = extracted.cleanName;
+      const nextBody = lines.join('\n');
+
+      const filtered = prevLineQuantities.filter(
+        (q) => q.lineIndex !== lineIdx
+      );
+      const nextQuantities: NoteLineQuantity[] = [
+        ...filtered,
+        {
+          lineIndex: lineIdx,
+          quantity: roundQuantityValue(extracted.quantity),
+          ...(resolvedUnit ? { unit: resolvedUnit } : {}),
+        },
+      ].sort((a, b) => a.lineIndex - b.lineIndex);
+
+      bodyRef.current = nextBody;
+      lineQuantitiesRef.current = nextQuantities;
+      setBody(nextBody);
+      setLineQuantities(nextQuantities);
+
+      triggerAutoTakeFeedback(
+        lineIdx,
+        prevBody,
+        prevLinePhotos,
+        prevLineQuantities
+      );
+
+      return { extracted: true, cleanName: extracted.cleanName };
+    },
+    [triggerAutoTakeFeedback]
+  );
+
   // Re-ensure visibility whenever visualViewport height changes while focused
   useEffect(() => {
     if (!isKeyboardMode) return;
@@ -498,6 +718,9 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
     } else if (wasViewportShrunkRef.current) {
       wasViewportShrunkRef.current = false;
       if (isFieldFocused) {
+        if (focusedNumberedLineRef.current !== null) {
+          applyAutoTakeOnLineFinish(focusedNumberedLineRef.current);
+        }
         const active = document.activeElement as HTMLElement | null;
         if (active && active.dataset.noteEditorField === 'true') {
           active.blur();
@@ -506,7 +729,7 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
         setIsFieldFocused(false);
       }
     }
-  }, [viewport.isViewportShrunk, isFieldFocused]);
+  }, [viewport.isViewportShrunk, isFieldFocused, applyAutoTakeOnLineFinish]);
 
   const handleFieldFocus = (lineIdx?: number) => {
     if (blurTimerRef.current !== null) {
@@ -534,10 +757,18 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
     }, 90);
   };
 
+  const handleNumberedLineBlur = (lineIdx: number) => {
+    applyAutoTakeOnLineFinish(lineIdx);
+    handleFieldBlur();
+  };
+
   const handleDoneKeyboard = () => {
     if (blurTimerRef.current !== null) {
       window.clearTimeout(blurTimerRef.current);
       blurTimerRef.current = null;
+    }
+    if (focusedNumberedLineRef.current !== null) {
+      applyAutoTakeOnLineFinish(focusedNumberedLineRef.current);
     }
     activeQtyLineRef.current = null;
     setActiveQtyLineIndex(null);
@@ -619,6 +850,7 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
       added.push({
         id: `np_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         dataUrl: compressed.dataUrl,
+        thumbnailDataUrl: compressed.thumbnailDataUrl,
         createdAt: Date.now(),
       });
     }
@@ -793,12 +1025,25 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
       setLineQuantities(nextQuantities);
       return;
     }
+    const existingEntry = lineQuantitiesRef.current.find(
+      (q) => q.lineIndex === lineIdx && q.quantity > 0
+    );
     const parsed = parseQuantityNumberInput(trimmed);
     if (parsed !== null) {
+      const unitForNew =
+        existingEntry === undefined
+          ? resolveQuantityUnit({
+              productName: rawLinesRef.current[lineIdx] || '',
+              unitMode: noteUnitModeRef.current,
+              defaultUnit: noteDefaultUnitRef.current,
+              memory: loadProductUnitMemory(),
+            })
+          : undefined;
       const nextQuantities = upsertLineQuantity(
         lineQuantitiesRef.current,
         lineIdx,
-        parsed
+        parsed,
+        unitForNew
       );
       lineQuantitiesRef.current = nextQuantities;
       setLineQuantities(nextQuantities);
@@ -810,7 +1055,12 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
       window.clearTimeout(blurTimerRef.current);
       blurTimerRef.current = null;
     }
-    // Note: if leaving a text line before this box, finalize its trailing quantity (already runs on textarea blur)
+    if (
+      focusedNumberedLineRef.current !== null &&
+      focusedNumberedLineRef.current !== lineIdx
+    ) {
+      applyAutoTakeOnLineFinish(focusedNumberedLineRef.current);
+    }
     focusedNumberedLineRef.current = null;
     activeLineIndexRef.current = lineIdx;
     activeQtyLineRef.current = lineIdx;
@@ -853,12 +1103,25 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
       return;
     }
 
+    const existingEntry = lineQuantitiesRef.current.find(
+      (q) => q.lineIndex === lineIdx && q.quantity > 0
+    );
     const parsed = parseQuantityNumberInput(cleaned);
     if (parsed !== null) {
+      const unitForNew =
+        existingEntry === undefined
+          ? resolveQuantityUnit({
+              productName: rawLinesRef.current[lineIdx] || '',
+              unitMode: noteUnitModeRef.current,
+              defaultUnit: noteDefaultUnitRef.current,
+              memory: loadProductUnitMemory(),
+            })
+          : undefined;
       const nextQuantities = upsertLineQuantity(
         lineQuantitiesRef.current,
         lineIdx,
-        parsed
+        parsed,
+        unitForNew
       );
       lineQuantitiesRef.current = nextQuantities;
       setLineQuantities(nextQuantities);
@@ -951,6 +1214,16 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
       (q) => q.lineIndex === lineIdx && q.quantity > 0
     );
     const nextUnit = existingEntry?.unit === unit ? undefined : unit;
+    const productName = rawLinesRef.current[lineIdx] || '';
+
+    if (noteUnitModeRef.current !== 'fixed') {
+      if (nextUnit) {
+        rememberUnitForProduct(productName, nextUnit);
+      } else {
+        forgetUnitForProduct(productName);
+      }
+    }
+
     const parsedDraft = parseQuantityNumberInput(qtyDraftRef.current);
     const resolvedQty =
       parsedDraft ?? existingEntry?.quantity ?? (nextUnit ? 1 : null);
@@ -976,12 +1249,18 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
     ].sort((a, b) => a.lineIndex - b.lineIndex);
     lineQuantitiesRef.current = nextQuantities;
     setLineQuantities(nextQuantities);
+    showTopUnitNotice(
+      nextUnit
+        ? `تم تغيير الوحدة إلى ${formatQuantityUnitLabel(nextUnit)}`
+        : 'تمت إزالة الوحدة'
+    );
   };
 
   const handleOpenManualDuplicateCheck = () => {
     if (isKeyboardMode) {
       handleDoneKeyboard();
     }
+    setUnitMismatchGroupIds([]);
     setShowDuplicateCheckSheet(true);
   };
 
@@ -1027,6 +1306,13 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
       keepIndex,
       removeIndices,
     });
+    if (res.unitMismatch) {
+      setUnitMismatchGroupIds((prev) =>
+        prev.includes(group.id) ? prev : [...prev, group.id]
+      );
+      return;
+    }
+    setUnitMismatchGroupIds((prev) => prev.filter((id) => id !== group.id));
     bodyRef.current = res.body;
     linePhotosRef.current = res.linePhotos;
     lineQuantitiesRef.current = res.lineQuantities;
@@ -1059,34 +1345,152 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
       window.clearTimeout(duplicateUndoTimerRef.current);
       duplicateUndoTimerRef.current = null;
     }
+    const restoredLineCount = duplicateUndo.previousBody.split('\n').length;
     bodyRef.current = duplicateUndo.previousBody;
     linePhotosRef.current = duplicateUndo.previousLinePhotos;
     lineQuantitiesRef.current = duplicateUndo.previousLineQuantities;
     setBody(duplicateUndo.previousBody);
     setLinePhotos(duplicateUndo.previousLinePhotos);
     setLineQuantities(duplicateUndo.previousLineQuantities);
+    if (
+      activeLineIndexRef.current !== null &&
+      activeLineIndexRef.current >= restoredLineCount
+    ) {
+      activeLineIndexRef.current = Math.max(0, restoredLineCount - 1);
+    }
+    if (
+      focusedNumberedLineRef.current !== null &&
+      focusedNumberedLineRef.current >= restoredLineCount
+    ) {
+      focusedNumberedLineRef.current = Math.max(0, restoredLineCount - 1);
+    }
     setDuplicateUndo(null);
   };
 
-  // Keyboard handlers for per-line editors (Enter moves to quantity box when Quantities mode is ON, Backspace at start merges)
+  // Helper called when finishing a non-empty item line via Enter or virtual keyboard '\n'
+  const advanceAfterAutoTakeOnLine = (
+    idx: number,
+    prevBodyBeforeAutoTake: string,
+    prevPhotosBeforeAutoTake: NoteLinePhoto[],
+    prevQuantitiesBeforeAutoTake: NoteLineQuantity[]
+  ): boolean => {
+    const preAutoLines = [...rawLinesRef.current];
+    const targetRaw = preAutoLines[idx] ?? '';
+    const extracted = extractAutoTakeQuantityAndUnit(targetRaw);
+    if (!extracted) return false;
+
+    const resolvedUnit = resolveQuantityUnit({
+      explicitUnit: extracted.unit,
+      productName: extracted.cleanName,
+      unitMode: noteUnitModeRef.current,
+      defaultUnit: noteDefaultUnitRef.current,
+      memory: loadProductUnitMemory(),
+    });
+    if (extracted.unit && noteUnitModeRef.current !== 'fixed') {
+      rememberUnitForProduct(extracted.cleanName, extracted.unit);
+    }
+
+    const updatedLines = [...preAutoLines];
+    updatedLines[idx] = extracted.cleanName;
+
+    const filteredQty = prevQuantitiesBeforeAutoTake.filter(
+      (q) => q.lineIndex !== idx
+    );
+    const updatedQuantities: NoteLineQuantity[] = [
+      ...filteredQty,
+      {
+        lineIndex: idx,
+        quantity: roundQuantityValue(extracted.quantity),
+        ...(resolvedUnit ? { unit: resolvedUnit } : {}),
+      },
+    ].sort((a, b) => a.lineIndex - b.lineIndex);
+
+    lineQuantitiesRef.current = updatedQuantities;
+    setLineQuantities(updatedQuantities);
+
+    const nextIdx = idx + 1;
+    const reuseNextBlank =
+      nextIdx < updatedLines.length && updatedLines[nextIdx].trim() === '';
+    if (!reuseNextBlank) {
+      updatedLines.splice(nextIdx, 0, '');
+    }
+
+    bodyRef.current = updatedLines.join('\n');
+    flushSync(() => {
+      if (!reuseNextBlank) {
+        const nextPhotos = realignLinePhotosAfterEdit(
+          preAutoLines,
+          updatedLines,
+          prevPhotosBeforeAutoTake
+        );
+        const nextQuantities = realignLineQuantitiesAfterEdit(
+          preAutoLines,
+          updatedLines,
+          updatedQuantities
+        );
+        linePhotosRef.current = nextPhotos;
+        lineQuantitiesRef.current = nextQuantities;
+        setLinePhotos(nextPhotos);
+        setLineQuantities(nextQuantities);
+      }
+      setBody(updatedLines.join('\n'));
+    });
+
+    triggerAutoTakeFeedback(
+      idx,
+      prevBodyBeforeAutoTake,
+      prevPhotosBeforeAutoTake,
+      prevQuantitiesBeforeAutoTake
+    );
+
+    focusedNumberedLineRef.current = nextIdx;
+    activeLineIndexRef.current = nextIdx;
+    const nextEl = lineInputRefs.current[nextIdx];
+    if (nextEl) {
+      nextEl.focus();
+      nextEl.setSelectionRange(0, 0);
+      scheduleScrollActiveLine(false);
+    }
+    return true;
+  };
+
+  // Keyboard handlers for per-line editors
   const handleNumberedLineChange = (idx: number, val: string) => {
     if (val.includes('\n')) {
       const inserted = val.split('\n');
 
       // Mobile virtual keyboards often insert '\n' via onChange instead of firing Enter keyDown:
-      // when Quantities mode is ON and user finishes a non-empty item line, jump directly to its quantity box
-      // without extracting or removing any numbers from the note text.
+      // when Quantities mode is ON and user finishes a non-empty item line:
+      // - if autoTakeNoteNumber is ON and trailing number matches -> extract number (+ unit) and move to next line
+      // - otherwise jump directly to its quantity box while leaving note text intact.
       if (
         quantitiesEnabledRef.current &&
         inserted.length === 2 &&
         inserted[1] === '' &&
         inserted[0].trim() !== ''
       ) {
+        const prevBodySnapshot = bodyRef.current;
+        const prevPhotosSnapshot = linePhotosRef.current;
+        const prevQuantitiesSnapshot = lineQuantitiesRef.current;
+
         const nextLines = [...rawLinesRef.current];
         nextLines[idx] = inserted[0];
         const cleanBody = nextLines.join('\n');
         bodyRef.current = cleanBody;
         setBody(cleanBody);
+
+        if (
+          autoTakeNoteNumberRef.current &&
+          advanceAfterAutoTakeOnLine(
+            idx,
+            prevBodySnapshot,
+            prevPhotosSnapshot,
+            prevQuantitiesSnapshot
+          )
+        ) {
+          return;
+        }
+
         const qtyEl = qtyInputRefs.current[idx];
         if (qtyEl) {
           qtyEl.focus();
@@ -1136,13 +1540,23 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
       const rawBefore = el.value.slice(0, start);
       const after = el.value.slice(end);
 
-      // In Quantities mode, pressing Enter at the end of any non-empty item line moves focus
-      // straight into that line's quantity box while keeping the note text (including any numbers) intact.
       if (
         quantitiesEnabledRef.current &&
         rawBefore.trim() !== '' &&
         after === ''
       ) {
+        if (
+          autoTakeNoteNumberRef.current &&
+          advanceAfterAutoTakeOnLine(
+            idx,
+            bodyRef.current,
+            linePhotosRef.current,
+            lineQuantitiesRef.current
+          )
+        ) {
+          return;
+        }
+
         const qtyEl = qtyInputRefs.current[idx];
         if (qtyEl) {
           qtyEl.focus();
@@ -1262,8 +1676,39 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
     void handleRecordWhatsAppSent();
   };
 
+  const handleCopyTouchStart = () => {
+    copyLongPressTriggeredRef.current = false;
+    if (copyLongPressTimerRef.current !== null) {
+      window.clearTimeout(copyLongPressTimerRef.current);
+    }
+    copyLongPressTimerRef.current = window.setTimeout(() => {
+      copyLongPressTriggeredRef.current = true;
+      copyLongPressTimerRef.current = null;
+      if (copyPreviewText) {
+        setShowCopyPreviewSheet(true);
+        if (
+          typeof navigator !== 'undefined' &&
+          typeof navigator.vibrate === 'function'
+        ) {
+          try {
+            navigator.vibrate(20);
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }, 480);
+  };
+
+  const cancelCopyHold = () => {
+    if (copyLongPressTimerRef.current !== null) {
+      window.clearTimeout(copyLongPressTimerRef.current);
+      copyLongPressTimerRef.current = null;
+    }
+  };
+
   const handleShareOtherApp = async () => {
-    setShowWhatsAppMoreMenu(false);
+    setShowToolbarMoreMenu(false);
     const result = await shareNoteViaOtherApp(
       { photos, linePhotos },
       whatsAppMessageText
@@ -1348,14 +1793,6 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
         active: false,
         onClick: () => setShowPhotoSourceMenu(true),
       },
-      {
-        id: 'duplicates',
-        label: 'فحص التكرار',
-        icon: CopyCheck,
-        isToggle: false,
-        active: false,
-        onClick: handleOpenManualDuplicateCheck,
-      },
     ],
     [numberingEnabled, quantitiesEnabled]
   );
@@ -1376,20 +1813,18 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
 
   const sentStatusText = useMemo(() => {
     if (!lastSentAt) return '';
-    return `أُرسلت · ${formatSentTimestampArabic(lastSentAt)}`;
+    return `أُرسلت ${formatSentTimestampArabic(lastSentAt)}`;
   }, [lastSentAt]);
 
   const hasAnyModalOpen =
     showCalcSheet ||
     showWhatsAppSheet ||
-    showWhatsAppMoreMenu ||
     showDuplicateCheckSheet ||
     showPhotoSourceMenu ||
     menuLineIndex !== null ||
     viewerTarget !== null ||
     showToolbarMoreMenu ||
     showCopyPreviewSheet ||
-    showCopyFormatSheet ||
     showNoteSettingsSheet;
 
   return (
@@ -1494,7 +1929,8 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
               data-testid="quantities-summary-chip"
               className="text-[11px] font-extrabold text-emerald-700 dark:text-emerald-300 tabular-nums shrink-0"
             >
-              {quantitiesSummary.itemCount} مادة · {formatQuantityNumber(quantitiesSummary.totalQuantity)}
+              {quantitiesSummary.itemCount} مادة · إجمالي{' '}
+              {formatQuantityNumber(quantitiesSummary.totalQuantity)}
             </span>
           )}
 
@@ -1548,22 +1984,18 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
               className="flex-1 min-w-0 bg-transparent text-lg font-extrabold text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none"
             />
 
-            <div className="text-left shrink-0 max-w-[44%]">
+            <div className="text-left shrink-0 max-w-[46%]">
               <div className="text-[11px] font-bold text-slate-400 dark:text-slate-500 truncate">
                 {dateLabel}
+                {sentStatusText ? ` · ${sentStatusText}` : ''}
               </div>
               {quantitiesEnabled && quantitiesSummary.quantifiedCount > 0 && (
                 <div
                   data-testid="quantities-summary-chip"
                   className="text-[11px] font-extrabold text-emerald-600 dark:text-emerald-400 tabular-nums truncate"
                 >
-                  {quantitiesSummary.itemCount} مادة · المجموع{' '}
+                  {quantitiesSummary.itemCount} مادة · إجمالي{' '}
                   {formatQuantityNumber(quantitiesSummary.totalQuantity)}
-                </div>
-              )}
-              {sentStatusText && (
-                <div className="text-[11px] font-bold text-emerald-600 dark:text-emerald-400 truncate">
-                  {sentStatusText}
                 </div>
               )}
             </div>
@@ -1620,6 +2052,32 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
             </button>
           </div>
         </header>
+      )}
+
+      {/* Non-blocking single-line notice directly under the header (merge, delete duplicate, unit/share feedback) */}
+      {(duplicateUndo || shareFeedback || topUnitNotice) && (
+        <div
+          data-testid="notes-top-notice"
+          className="px-3 py-1.5 bg-emerald-50 dark:bg-emerald-950/60 border-b border-emerald-200/70 dark:border-emerald-800/50 shrink-0"
+        >
+          <div className="max-w-3xl mx-auto flex items-center justify-between gap-2 text-xs">
+            <span className="font-bold text-slate-800 dark:text-slate-100 truncate">
+              {duplicateUndo?.label ?? shareFeedback ?? topUnitNotice}
+            </span>
+            {duplicateUndo && (
+              <button
+                type="button"
+                data-testid="note-undo-button"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={handleUndoDuplicateAction}
+                className="px-2.5 py-1 rounded-lg bg-emerald-500 text-white text-[11px] font-extrabold flex items-center gap-1 shrink-0 active:scale-95 transition"
+              >
+                <Undo2 className="w-3.5 h-3.5" />
+                <span>تراجع</span>
+              </button>
+            )}
+          </div>
+        </div>
       )}
 
       {/* Middle: Scrollable Editor Body (takes ALL remaining height) */}
@@ -1726,7 +2184,7 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
                             rows={1}
                             value={lineText}
                             onFocus={() => handleFieldFocus(idx)}
-                            onBlur={handleFieldBlur}
+                            onBlur={() => handleNumberedLineBlur(idx)}
                             onClick={() => {
                               activeLineIndexRef.current = idx;
                               scheduleScrollActiveLine(false);
@@ -1754,10 +2212,14 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
                           )}
                         </div>
 
-                        {/* Aligned Direct-Input Quantity Box Column at Line End */}
+                        {/* Aligned Direct-Input Quantity Box Column at Line End (+ tiny 4s undo icon when auto-taken) */}
                         {quantitiesEnabled &&
                           (() => {
                             const isQtyActive = activeQtyLineIndex === idx;
+                            const isQtyHighlighted =
+                              highlightedQtyLineIndex === idx;
+                            const showLineUndo =
+                              autoTakeUndo?.lineIndex === idx;
                             const displayQty =
                               lineQty !== undefined
                                 ? formatQuantityNumber(lineQty.quantity)
@@ -1769,10 +2231,32 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
                               ? formatQuantityUnitLabel(lineQty.unit)
                               : '';
                             return (
-                              <div className="w-[60px] shrink-0 flex justify-end pt-0.5">
+                              <div className="shrink-0 flex items-center justify-end gap-1 pt-0.5">
+                                {showLineUndo && (
+                                  <button
+                                    type="button"
+                                    data-testid={`line-auto-undo-${idx}`}
+                                    onMouseDown={(e) => e.preventDefault()}
+                                    onClick={handleUndoAutoTake}
+                                    aria-label="تراجع عن أخذ الرقم"
+                                    title="تراجع"
+                                    className={`w-7 h-7 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-300/80 dark:border-slate-700 text-slate-700 dark:text-slate-200 flex items-center justify-center shrink-0 active:scale-90 transition-opacity duration-300 ${
+                                      autoTakeUndo.fading
+                                        ? 'opacity-0'
+                                        : 'opacity-100'
+                                    }`}
+                                  >
+                                    <Undo2 className="w-3.5 h-3.5" />
+                                  </button>
+                                )}
                                 <div
-                                  className={`w-[56px] min-h-[40px] rounded-xl flex flex-col items-center justify-center px-1 py-0.5 transition ${
-                                    isQtyActive
+                                  data-qty-highlighted={
+                                    isQtyHighlighted ? 'true' : 'false'
+                                  }
+                                  className={`w-[56px] min-h-[40px] rounded-xl flex flex-col items-center justify-center px-1 py-0.5 transition-all duration-300 ${
+                                    isQtyHighlighted
+                                      ? 'bg-emerald-500/25 border-2 border-emerald-500 ring-2 ring-emerald-400/50 scale-[1.04]'
+                                      : isQtyActive
                                       ? 'bg-emerald-500/15 border-2 border-emerald-500 ring-2 ring-emerald-500/15'
                                       : lineQty !== undefined
                                       ? 'bg-emerald-500/12 border border-emerald-500/40'
@@ -1979,52 +2463,15 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
         </div>
       </div>
 
-      {/* 5-second Undo Toast after manual duplicate merge/delete */}
-      {duplicateUndo && (
-        <div
-          className={`absolute inset-x-3 z-40 flex justify-center pointer-events-none ${
-            quantitiesEnabled && !isKeyboardMode ? 'bottom-24' : 'bottom-16'
-          }`}
-        >
-          <div className="pointer-events-auto bg-slate-900 dark:bg-slate-800 text-white rounded-2xl px-4 py-2.5 shadow-xl border border-slate-700 flex items-center gap-3">
-            <span className="text-xs font-bold">{duplicateUndo.label}</span>
-            <button
-              type="button"
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={handleUndoDuplicateAction}
-              className="min-h-[38px] px-3 rounded-xl bg-emerald-500 text-white text-xs font-extrabold flex items-center gap-1 active:scale-95 transition"
-            >
-              <Undo2 className="w-4 h-4" />
-              <span>تراجع</span>
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Share Feedback Toast */}
-      {shareFeedback && (
-        <div
-          className={`absolute inset-x-3 z-40 flex justify-center pointer-events-none ${
-            quantitiesEnabled && !isKeyboardMode ? 'bottom-24' : 'bottom-16'
-          }`}
-        >
-          <div className="bg-slate-900 dark:bg-slate-800 text-white rounded-2xl px-4 py-2.5 shadow-xl border border-slate-700 text-xs font-bold">
-            {shareFeedback}
-          </div>
-        </div>
-      )}
-
-      {/* Floating Keyboard Bar: optional "كارتون / قطع" unit pills when typing in a quantity box + "تم" button */}
+      {/* Floating Keyboard Bar: compact 5-unit chips strip when typing in a quantity box + "تم" button */}
       {isKeyboardMode && (
         <div className="absolute inset-x-3 bottom-3 z-40 flex items-center justify-between gap-2 pointer-events-none">
           {activeQtyLineIndex !== null ? (
-            <div className="pointer-events-auto flex items-center gap-1.5 bg-white/95 dark:bg-slate-900/95 border border-slate-200 dark:border-slate-700 rounded-2xl p-1 shadow-lg">
-              {(
-                [
-                  { id: 'carton', label: 'كارتون' },
-                  { id: 'piece', label: 'قطع' },
-                ] as const
-              ).map((opt) => {
+            <div
+              data-testid="qty-unit-strip"
+              className="pointer-events-auto flex items-center gap-1 overflow-x-auto no-scrollbar bg-white/95 dark:bg-slate-900/95 border border-slate-200 dark:border-slate-700 rounded-2xl p-1 shadow-lg max-w-full min-w-0"
+            >
+              {NOTE_QUANTITY_UNIT_OPTIONS.map((opt) => {
                 const isSelected =
                   lineQuantityMap.get(activeQtyLineIndex)?.unit === opt.id;
                 return (
@@ -2035,7 +2482,7 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
                     aria-pressed={isSelected}
                     onMouseDown={(e) => e.preventDefault()}
                     onClick={() => handleToggleActiveQtyUnit(opt.id)}
-                    className={`min-h-[36px] px-3 rounded-xl text-xs font-extrabold transition active:scale-95 ${
+                    className={`min-h-[34px] px-2.5 rounded-xl text-[11px] font-extrabold whitespace-nowrap shrink-0 transition active:scale-95 ${
                       isSelected
                         ? 'bg-emerald-500 text-white shadow-xs'
                         : 'bg-[#F7F8FA] dark:bg-slate-800 text-slate-700 dark:text-slate-200'
@@ -2052,9 +2499,10 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
 
           <button
             type="button"
+            data-testid="keyboard-done-button"
             onMouseDown={(e) => e.preventDefault()}
             onClick={handleDoneKeyboard}
-            className="pointer-events-auto min-h-[44px] px-4 rounded-2xl bg-emerald-500 text-white font-extrabold text-sm shadow-lg shadow-emerald-500/25 flex items-center gap-1.5 active:scale-95 transition shrink-0"
+            className="pointer-events-auto min-h-[42px] px-3.5 rounded-2xl bg-emerald-500 text-white font-extrabold text-sm shadow-lg shadow-emerald-500/25 flex items-center gap-1.5 active:scale-95 transition shrink-0"
             aria-label="إغلاق لوحة المفاتيح"
           >
             <Check className="w-4 h-4" />
@@ -2063,146 +2511,111 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
         </div>
       )}
 
-      {/* Normal Mode Fixed Bottom Action Bar (hidden when keyboard open) */}
+      {/* Normal Mode Fixed Bottom Action Bar (3 buttons: نسخ, واتساب, حاسبة + optional ناتج الحاسبة) */}
       {!isKeyboardMode && (
-        <div className="px-3 py-1.5 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-t border-slate-200/80 dark:border-slate-800 shrink-0">
-          <div className="max-w-3xl mx-auto grid grid-cols-[1.08fr_0.74fr_1.42fr_0.96fr] items-start gap-1.5">
-            {/* 1. المجموع (value on the side) */}
+        <div
+          data-testid="notes-bottom-bar"
+          className="px-3 py-2 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-t border-slate-200/80 dark:border-slate-800 shrink-0"
+        >
+          <div className="max-w-3xl mx-auto flex items-center gap-1.5">
+            {/* 1. نسخ (primary, wider; long-press opens معاينة النسخ) */}
             <button
               type="button"
-              onClick={handleCopyTotal}
-              className="h-11 px-1.5 rounded-xl bg-[#F7F8FA] dark:bg-slate-800 border border-slate-200/80 dark:border-slate-700 text-slate-800 dark:text-slate-100 font-bold text-[11px] flex items-center justify-center gap-1 min-w-0 active:scale-95 transition"
-              aria-label="نسخ المجموع"
+              data-testid="copy-note-button"
+              onTouchStart={handleCopyTouchStart}
+              onTouchMove={cancelCopyHold}
+              onTouchEnd={cancelCopyHold}
+              onTouchCancel={cancelCopyHold}
+              onMouseDown={handleCopyTouchStart}
+              onMouseUp={cancelCopyHold}
+              onMouseLeave={cancelCopyHold}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                cancelCopyHold();
+                if (copyPreviewText) {
+                  setShowCopyPreviewSheet(true);
+                }
+              }}
+              onClick={() => {
+                if (copyLongPressTriggeredRef.current) {
+                  copyLongPressTriggeredRef.current = false;
+                  return;
+                }
+                void handleCopyNote();
+              }}
+              disabled={!title.trim() && !body.trim()}
+              className="flex-[1.3] min-w-[74px] h-11 px-2.5 rounded-xl bg-emerald-500 text-white font-extrabold text-xs flex items-center justify-center gap-1.5 shadow-sm active:scale-95 transition disabled:opacity-40 select-none"
+              aria-label="نسخ الملاحظة"
             >
-              {copiedTotal ? (
+              {copiedNote ? (
                 <>
-                  <Check className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
-                  <span className="text-emerald-600 dark:text-emerald-400 truncate">
-                    تم
-                  </span>
+                  <Check className="w-4 h-4 shrink-0" />
+                  <span className="whitespace-nowrap">تم</span>
                 </>
               ) : (
                 <>
-                  <span className="text-slate-500 dark:text-slate-400 shrink-0">
-                    المجموع
-                  </span>
-                  <span
-                    dir="ltr"
-                    className="font-extrabold text-emerald-600 dark:text-emerald-400 tabular-nums truncate"
-                  >
-                    {mathAnalysis.hasAnyCalculated
-                      ? formatMathNumber(mathAnalysis.total)
-                      : '0'}
-                  </span>
+                  <Copy className="w-4 h-4 shrink-0" />
+                  <span className="whitespace-nowrap">نسخ</span>
                 </>
               )}
             </button>
 
-            {/* 2. نسخ (+ معاينة link when quantitiesEnabled is ON) */}
-            <div className="flex flex-col items-center min-w-0">
-              <button
-                type="button"
-                onClick={handleCopyNote}
-                disabled={!title.trim() && !body.trim()}
-                className="w-full h-11 px-1.5 rounded-xl bg-[#F7F8FA] dark:bg-slate-800 border border-slate-200/80 dark:border-slate-700 text-slate-800 dark:text-slate-100 font-bold text-[11px] flex items-center justify-center gap-1 min-w-0 active:scale-95 transition disabled:opacity-40"
-                aria-label="نسخ الملاحظة"
-              >
-                {copiedNote ? (
-                  <>
-                    <Check className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
-                    <span className="text-emerald-600 dark:text-emerald-400 truncate">
-                      تم
-                    </span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="w-3.5 h-3.5 shrink-0" />
-                    <span className="truncate">نسخ</span>
-                  </>
-                )}
-              </button>
+            {/* 2. واتساب (إرسال مباشر) */}
+            <button
+              type="button"
+              onClick={handleDirectWhatsAppSend}
+              disabled={!whatsAppMessageText.trim()}
+              className={`${
+                mathAnalysis.hasAnyCalculated ? 'shrink-0 px-2.5' : 'flex-1 px-2.5'
+              } h-11 rounded-xl bg-[#F7F8FA] dark:bg-slate-800 border border-slate-200/80 dark:border-slate-700 text-emerald-700 dark:text-emerald-400 font-extrabold text-xs flex items-center justify-center gap-1 whitespace-nowrap active:scale-95 transition disabled:opacity-40`}
+              aria-label="إرسال مباشر عبر واتساب"
+            >
+              <WhatsAppIcon className="w-4 h-4 shrink-0 text-[#25D366]" />
+              <span>واتساب</span>
+            </button>
 
-              {quantitiesEnabled && (
+            {/* 3. حاسبة + ناتج الحاسبة (only when note has calculator lines) */}
+            <div
+              className={`flex items-center gap-1.5 ${
+                mathAnalysis.hasAnyCalculated ? 'min-w-0 shrink' : 'flex-1 min-w-0'
+              }`}
+            >
+              {mathAnalysis.hasAnyCalculated && (
                 <button
                   type="button"
-                  onClick={() => setShowCopyPreviewSheet(true)}
-                  disabled={!copyPreviewText}
-                  className="mt-0.5 py-0.5 px-2 text-[11px] font-extrabold text-emerald-600 dark:text-emerald-400 flex items-center gap-1 hover:underline disabled:opacity-40"
+                  data-testid="calc-result-chip"
+                  onClick={handleCopyTotal}
+                  className="h-11 px-2 rounded-xl bg-emerald-500/12 border border-emerald-500/30 text-emerald-700 dark:text-emerald-300 font-extrabold text-[11px] flex items-center gap-1 min-w-0 max-w-[132px] active:scale-95 transition"
+                  aria-label="نسخ ناتج الحاسبة"
                 >
-                  <Eye className="w-3 h-3 shrink-0" />
-                  <span>معاينة</span>
+                  {copiedTotal ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 shrink-0" />
+                      <span className="whitespace-nowrap">تم</span>
+                    </>
+                  ) : (
+                    <>
+                      <span className="whitespace-nowrap">ناتج الحاسبة:</span>
+                      <span dir="ltr" className="tabular-nums truncate">
+                        {formatMathNumber(mathAnalysis.total)}
+                      </span>
+                    </>
+                  )}
                 </button>
               )}
-            </div>
-
-            {/* 3. واتساب (مباشر) + زر ⋯ للخيارات الثانوية */}
-            <div className="flex items-center gap-1 min-w-0">
-              <button
-                type="button"
-                onClick={handleDirectWhatsAppSend}
-                disabled={!whatsAppMessageText.trim()}
-                className="flex-1 h-11 px-1.5 rounded-xl bg-[#F7F8FA] dark:bg-slate-800 border border-slate-200/80 dark:border-slate-700 text-emerald-700 dark:text-emerald-400 font-extrabold text-[11px] flex items-center justify-center gap-1 min-w-0 active:scale-95 transition disabled:opacity-40"
-                aria-label="إرسال مباشر عبر واتساب"
-              >
-                <WhatsAppIcon className="w-3.5 h-3.5 shrink-0 text-[#25D366]" />
-                <span className="truncate">واتساب</span>
-              </button>
 
               <button
                 type="button"
-                onClick={() => setShowWhatsAppMoreMenu((v) => !v)}
-                className="w-8 h-11 rounded-xl bg-[#F7F8FA] dark:bg-slate-800 border border-slate-200/80 dark:border-slate-700 text-slate-600 dark:text-slate-300 flex items-center justify-center shrink-0 active:scale-95 transition"
-                aria-label="خيارات أخرى للمشاركة"
+                onClick={() => setShowCalcSheet(true)}
+                className={`${
+                  mathAnalysis.hasAnyCalculated ? 'shrink-0 px-2.5' : 'w-full px-2.5'
+                } h-11 rounded-xl bg-[#F7F8FA] dark:bg-slate-800 border border-slate-200/80 dark:border-slate-700 text-slate-800 dark:text-slate-100 font-extrabold text-xs flex items-center justify-center gap-1 whitespace-nowrap active:scale-95 transition`}
+                aria-label="فتح الآلة الحاسبة"
               >
-                <MoreHorizontal className="w-4 h-4" />
+                <Calculator className="w-4 h-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                <span>حاسبة</span>
               </button>
             </div>
-
-            {/* 4. حاسبة */}
-            <button
-              type="button"
-              onClick={() => setShowCalcSheet(true)}
-              className="h-11 px-1.5 rounded-xl bg-[#F7F8FA] dark:bg-slate-800 border border-slate-200/80 dark:border-slate-700 text-slate-800 dark:text-slate-100 font-bold text-[11px] flex items-center justify-center gap-1 min-w-0 active:scale-95 transition"
-              aria-label="فتح الآلة الحاسبة"
-            >
-              <Calculator className="w-3.5 h-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
-              <span className="truncate">حاسبة</span>
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Secondary Share Options Menu ("⋯") */}
-      {showWhatsAppMoreMenu && (
-        <div
-          className="fixed inset-0 z-50 bg-slate-950/35 flex items-end justify-center p-3 pb-[calc(4.5rem+env(safe-area-inset-bottom,0px))]"
-          dir="rtl"
-          onClick={() => setShowWhatsAppMoreMenu(false)}
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            className="bg-white dark:bg-slate-900 w-full max-w-sm rounded-2xl p-2 shadow-2xl border border-slate-200 dark:border-slate-800 space-y-1"
-          >
-            <button
-              type="button"
-              onClick={handleShareOtherApp}
-              className="w-full min-h-[48px] px-3.5 rounded-xl hover:bg-[#F7F8FA] dark:hover:bg-slate-800 text-slate-900 dark:text-white font-bold text-sm flex items-center gap-3 active:scale-[0.99] transition text-right"
-            >
-              <Share2 className="w-4 h-4 text-emerald-500 shrink-0" />
-              <span>مشاركة بتطبيق آخر</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                setShowWhatsAppMoreMenu(false);
-                setShowWhatsAppSheet(true);
-              }}
-              className="w-full min-h-[48px] px-3.5 rounded-xl hover:bg-[#F7F8FA] dark:hover:bg-slate-800 text-slate-900 dark:text-white font-bold text-sm flex items-center gap-3 active:scale-[0.99] transition text-right"
-            >
-              <Users className="w-4 h-4 text-emerald-500 shrink-0" />
-              <span>أشخاص محفوظون</span>
-            </button>
           </div>
         </div>
       )}
@@ -2311,6 +2724,15 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
                         );
                       })}
                     </div>
+
+                    {unitMismatchGroupIds.includes(group.id) && (
+                      <div
+                        data-testid="duplicate-unit-mismatch-note"
+                        className="rounded-xl bg-amber-500/12 border border-amber-500/30 px-2.5 py-1.5 text-[11px] font-bold text-amber-700 dark:text-amber-300"
+                      >
+                        تختلف الوحدات — تم إبقاء السطور دون دمج
+                      </div>
+                    )}
 
                     <div className="flex items-center gap-2 pt-1">
                       {quantitiesEnabled && (
@@ -2624,7 +3046,7 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
         </div>
       )}
 
-      {/* Toolbar "⋯" Overflow & Secondary Actions Sheet */}
+      {/* "المزيد" Grouped Bottom Sheet */}
       {showToolbarMoreMenu && (
         <div
           className="fixed inset-0 z-50 bg-slate-950/60 flex items-end sm:items-center justify-center p-0 sm:p-4"
@@ -2632,12 +3054,13 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
           onClick={() => setShowToolbarMoreMenu(false)}
         >
           <div
+            data-testid="notes-more-sheet"
             onClick={(e) => e.stopPropagation()}
-            className="bg-white dark:bg-slate-900 w-full max-w-md rounded-t-[24px] sm:rounded-[20px] px-4 pt-4 pb-[calc(1rem+env(safe-area-inset-bottom,0px))] shadow-2xl border border-slate-200 dark:border-slate-800 space-y-2"
+            className="bg-white dark:bg-slate-900 w-full max-w-md rounded-t-[24px] sm:rounded-[20px] px-4 pt-4 pb-[calc(1rem+env(safe-area-inset-bottom,0px))] shadow-2xl border border-slate-200 dark:border-slate-800 space-y-2.5 max-h-[85vh] overflow-y-auto"
           >
             <div className="flex items-center justify-between pb-1">
               <h3 className="text-base font-extrabold text-slate-900 dark:text-white">
-                المزيد من الخيارات
+                المزيد
               </h3>
               <button
                 type="button"
@@ -2650,7 +3073,7 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
             </div>
 
             {overflowToolbarButtons.length > 0 && (
-              <div className="space-y-1.5 pb-2 border-b border-slate-200/80 dark:border-slate-800">
+              <div className="space-y-1 pb-2 border-b border-slate-200/80 dark:border-slate-800">
                 {overflowToolbarButtons.map((btn) => {
                   const Icon = btn.icon;
                   return (
@@ -2661,7 +3084,7 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
                         setShowToolbarMoreMenu(false);
                         btn.onClick();
                       }}
-                      className="w-full min-h-[48px] px-3.5 rounded-xl bg-[#F7F8FA] dark:bg-slate-800 text-slate-900 dark:text-white font-bold text-sm flex items-center justify-between gap-3 active:scale-[0.99] transition"
+                      className="w-full min-h-[46px] px-3.5 rounded-xl bg-[#F7F8FA] dark:bg-slate-800 text-slate-900 dark:text-white font-bold text-sm flex items-center justify-between gap-3 active:scale-[0.99] transition"
                     >
                       <span className="flex items-center gap-3">
                         <Icon className="w-4 h-4 text-emerald-500 shrink-0" />
@@ -2682,63 +3105,143 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
               </div>
             )}
 
-            <button
-              type="button"
-              onClick={() => {
-                setResetAfterBlankLine((prev) => {
-                  const next = !prev;
-                  if (next && !numberingEnabled) {
-                    setNumberingEnabled(true);
-                  }
-                  return next;
-                });
-                setShowToolbarMoreMenu(false);
-              }}
-              className="w-full min-h-[48px] px-3.5 rounded-xl hover:bg-[#F7F8FA] dark:hover:bg-slate-800 text-slate-900 dark:text-white font-bold text-sm flex items-center justify-between gap-3 active:scale-[0.99] transition text-right"
-            >
-              <span className="flex items-center gap-3">
-                <ListRestart className="w-4 h-4 text-emerald-500 shrink-0" />
-                <span>إعادة الترقيم بعد الفراغ</span>
-              </span>
-              <span
-                className={`text-xs font-extrabold ${
-                  numberingEnabled && resetAfterBlankLine
-                    ? 'text-emerald-600'
-                    : 'text-slate-400'
-                }`}
+            {/* Group 1: الإدخال */}
+            <div className="space-y-1">
+              <div className="px-2 text-[11px] font-extrabold text-slate-400 dark:text-slate-500">
+                الإدخال
+              </div>
+
+              <button
+                type="button"
+                data-testid="note-menu-auto-take"
+                onClick={() => {
+                  onUpdateNoteSettings?.({
+                    autoTakeNoteNumber: !autoTakeNoteNumber,
+                  });
+                  setShowToolbarMoreMenu(false);
+                }}
+                className="w-full min-h-[46px] px-3.5 rounded-xl hover:bg-[#F7F8FA] dark:hover:bg-slate-800 text-slate-900 dark:text-white font-bold text-sm flex items-center justify-between gap-3 active:scale-[0.99] transition text-right"
               >
-                {numberingEnabled && resetAfterBlankLine ? 'مفعّل' : 'متوقف'}
-              </span>
-            </button>
+                <span className="flex items-center gap-3 min-w-0">
+                  <Package className="w-4 h-4 text-emerald-500 shrink-0" />
+                  <span>أخذ الرقم تلقائياً</span>
+                </span>
+                <span
+                  className={`text-xs font-extrabold shrink-0 ${
+                    autoTakeNoteNumber
+                      ? 'text-emerald-600 dark:text-emerald-400'
+                      : 'text-slate-400'
+                  }`}
+                >
+                  {autoTakeNoteNumber ? 'مفعّل' : 'متوقف'}
+                </span>
+              </button>
 
-            <button
-              type="button"
-              onClick={() => {
-                setShowToolbarMoreMenu(false);
-                setShowCopyFormatSheet(true);
-              }}
-              className="w-full min-h-[48px] px-3.5 rounded-xl hover:bg-[#F7F8FA] dark:hover:bg-slate-800 text-slate-900 dark:text-white font-bold text-sm flex items-center gap-3 active:scale-[0.99] transition text-right"
-            >
-              <SlidersHorizontal className="w-4 h-4 text-emerald-500 shrink-0" />
-              <span>شكل النسخ</span>
-            </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setResetAfterBlankLine((prev) => {
+                    const next = !prev;
+                    if (next && !numberingEnabled) {
+                      setNumberingEnabled(true);
+                    }
+                    return next;
+                  });
+                  setShowToolbarMoreMenu(false);
+                }}
+                className="w-full min-h-[46px] px-3.5 rounded-xl hover:bg-[#F7F8FA] dark:hover:bg-slate-800 text-slate-900 dark:text-white font-bold text-sm flex items-center justify-between gap-3 active:scale-[0.99] transition text-right"
+              >
+                <span className="flex items-center gap-3">
+                  <ListRestart className="w-4 h-4 text-emerald-500 shrink-0" />
+                  <span>إعادة الترقيم بعد الفراغ</span>
+                </span>
+                <span
+                  className={`text-xs font-extrabold ${
+                    numberingEnabled && resetAfterBlankLine
+                      ? 'text-emerald-600 dark:text-emerald-400'
+                      : 'text-slate-400'
+                  }`}
+                >
+                  {numberingEnabled && resetAfterBlankLine ? 'مفعّل' : 'متوقف'}
+                </span>
+              </button>
 
-            <button
-              type="button"
-              onClick={() => {
-                setShowToolbarMoreMenu(false);
-                setShowNoteSettingsSheet(true);
-              }}
-              className="w-full min-h-[48px] px-3.5 rounded-xl hover:bg-[#F7F8FA] dark:hover:bg-slate-800 text-slate-900 dark:text-white font-bold text-sm flex items-center gap-3 active:scale-[0.99] transition text-right"
-            >
-              <Settings2 className="w-4 h-4 text-emerald-500 shrink-0" />
-              <span>إعدادات الملاحظات</span>
-            </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowToolbarMoreMenu(false);
+                  handleOpenManualDuplicateCheck();
+                }}
+                className="w-full min-h-[46px] px-3.5 rounded-xl hover:bg-[#F7F8FA] dark:hover:bg-slate-800 text-slate-900 dark:text-white font-bold text-sm flex items-center gap-3 active:scale-[0.99] transition text-right"
+              >
+                <CopyCheck className="w-4 h-4 text-emerald-500 shrink-0" />
+                <span>فحص التكرار</span>
+              </button>
+            </div>
+
+            {/* Group 2: النسخ والإرسال */}
+            <div className="space-y-1 pt-1 border-t border-slate-100 dark:border-slate-800">
+              <div className="px-2 text-[11px] font-extrabold text-slate-400 dark:text-slate-500">
+                النسخ والإرسال
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setShowToolbarMoreMenu(false);
+                  setShowCopyPreviewSheet(true);
+                }}
+                className="w-full min-h-[46px] px-3.5 rounded-xl hover:bg-[#F7F8FA] dark:hover:bg-slate-800 text-slate-900 dark:text-white font-bold text-sm flex items-center gap-3 active:scale-[0.99] transition text-right"
+              >
+                <Eye className="w-4 h-4 text-emerald-500 shrink-0" />
+                <span>معاينة النسخ</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleShareOtherApp}
+                className="w-full min-h-[46px] px-3.5 rounded-xl hover:bg-[#F7F8FA] dark:hover:bg-slate-800 text-slate-900 dark:text-white font-bold text-sm flex items-center gap-3 active:scale-[0.99] transition text-right"
+              >
+                <Share2 className="w-4 h-4 text-emerald-500 shrink-0" />
+                <span>مشاركة بتطبيق آخر</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setShowToolbarMoreMenu(false);
+                  setShowWhatsAppSheet(true);
+                }}
+                className="w-full min-h-[46px] px-3.5 rounded-xl hover:bg-[#F7F8FA] dark:hover:bg-slate-800 text-slate-900 dark:text-white font-bold text-sm flex items-center gap-3 active:scale-[0.99] transition text-right"
+              >
+                <Users className="w-4 h-4 text-emerald-500 shrink-0" />
+                <span>أشخاص محفوظون</span>
+              </button>
+            </div>
+
+            {/* Group 3: الإعدادات */}
+            <div className="space-y-1 pt-1 border-t border-slate-100 dark:border-slate-800">
+              <div className="px-2 text-[11px] font-extrabold text-slate-400 dark:text-slate-500">
+                الإعدادات
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setShowToolbarMoreMenu(false);
+                  setShowNoteSettingsSheet(true);
+                }}
+                className="w-full min-h-[46px] px-3.5 rounded-xl hover:bg-[#F7F8FA] dark:hover:bg-slate-800 text-slate-900 dark:text-white font-bold text-sm flex items-center gap-3 active:scale-[0.99] transition text-right"
+              >
+                <Settings2 className="w-4 h-4 text-emerald-500 shrink-0" />
+                <span>إعدادات الملاحظات</span>
+              </button>
+            </div>
           </div>
         </div>
       )}
 
-      {/* Copy Preview Sheet ("معاينة") */}
+      {/* Copy Preview Sheet ("معاينة النسخ") */}
       {showCopyPreviewSheet && (
         <div
           className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4"
@@ -2746,6 +3249,7 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
           onClick={() => setShowCopyPreviewSheet(false)}
         >
           <div
+            data-testid="copy-preview-sheet"
             onClick={(e) => e.stopPropagation()}
             className="bg-white dark:bg-slate-900 w-full max-w-md rounded-t-[24px] sm:rounded-[20px] px-4 pt-4 pb-[calc(1rem+env(safe-area-inset-bottom,0px))] shadow-2xl border border-slate-200 dark:border-slate-800 max-h-[82vh] flex flex-col gap-3"
           >
@@ -2753,7 +3257,7 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
               <div className="flex items-center gap-2">
                 <Eye className="w-5 h-5 text-emerald-500" />
                 <h3 className="text-base font-extrabold text-slate-900 dark:text-white">
-                  معاينة قبل النسخ
+                  معاينة النسخ
                 </h3>
               </div>
               <button
@@ -2791,7 +3295,7 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
                 type="button"
                 onClick={() => {
                   setShowCopyPreviewSheet(false);
-                  setShowCopyFormatSheet(true);
+                  setShowNoteSettingsSheet(true);
                 }}
                 className="min-h-[48px] px-4 rounded-2xl bg-[#F7F8FA] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-100 font-bold text-xs flex items-center gap-1.5 active:scale-95 transition"
               >
@@ -2803,195 +3307,27 @@ export const NoteEditorView: React.FC<NoteEditorViewProps> = ({
         </div>
       )}
 
-      {/* Copy Format Sheet ("شكل النسخ") */}
-      {showCopyFormatSheet && (
-        <div
-          className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4"
-          dir="rtl"
-          onClick={() => setShowCopyFormatSheet(false)}
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            className="bg-white dark:bg-slate-900 w-full max-w-md rounded-t-[24px] sm:rounded-[20px] px-4 pt-4 pb-[calc(1rem+env(safe-area-inset-bottom,0px))] shadow-2xl border border-slate-200 dark:border-slate-800 space-y-4"
-          >
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <SlidersHorizontal className="w-5 h-5 text-emerald-500" />
-                <h3 className="text-base font-extrabold text-slate-900 dark:text-white">
-                  شكل النسخ والإرسال
-                </h3>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowCopyFormatSheet(false)}
-                className="w-10 h-10 rounded-xl bg-[#F7F8FA] dark:bg-slate-800 text-slate-500 flex items-center justify-center"
-                aria-label="إغلاق"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <div className="space-y-2">
-              <div className="text-xs font-extrabold text-slate-500 dark:text-slate-400">
-                ترتيب السطور عند النسخ
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  type="button"
-                  onClick={() =>
-                    onUpdateNoteSettings?.({ noteCopySortOrder: 'as-written' })
-                  }
-                  className={`min-h-[44px] rounded-xl text-xs font-extrabold border transition ${
-                    noteCopySortOrder === 'as-written'
-                      ? 'bg-emerald-500 text-white border-emerald-500'
-                      : 'bg-[#F7F8FA] dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-slate-200 dark:border-slate-700'
-                  }`}
-                >
-                  كما كتبتها
-                </button>
-                <button
-                  type="button"
-                  onClick={() =>
-                    onUpdateNoteSettings?.({ noteCopySortOrder: 'alphabetical' })
-                  }
-                  className={`min-h-[44px] rounded-xl text-xs font-extrabold border transition ${
-                    noteCopySortOrder === 'alphabetical'
-                      ? 'bg-emerald-500 text-white border-emerald-500'
-                      : 'bg-[#F7F8FA] dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-slate-200 dark:border-slate-700'
-                  }`}
-                >
-                  ترتيب أبجدي
-                </button>
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              <div className="text-xs font-extrabold text-slate-500 dark:text-slate-400">
-                شكل الأرقام
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  type="button"
-                  onClick={() =>
-                    onUpdateNoteSettings?.({ noteCopyDigitStyle: 'western' })
-                  }
-                  className={`min-h-[44px] rounded-xl text-xs font-extrabold border transition ${
-                    noteCopyDigitStyle === 'western'
-                      ? 'bg-emerald-500 text-white border-emerald-500'
-                      : 'bg-[#F7F8FA] dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-slate-200 dark:border-slate-700'
-                  }`}
-                >
-                  إنجليزية (123)
-                </button>
-                <button
-                  type="button"
-                  onClick={() =>
-                    onUpdateNoteSettings?.({ noteCopyDigitStyle: 'arabic' })
-                  }
-                  className={`min-h-[44px] rounded-xl text-xs font-extrabold border transition ${
-                    noteCopyDigitStyle === 'arabic'
-                      ? 'bg-emerald-500 text-white border-emerald-500'
-                      : 'bg-[#F7F8FA] dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-slate-200 dark:border-slate-700'
-                  }`}
-                >
-                  عربية (١٢٣)
-                </button>
-              </div>
-            </div>
-
-            <label className="flex items-center justify-between gap-3 p-3 rounded-2xl bg-[#F7F8FA] dark:bg-slate-800 cursor-pointer">
-              <span className="text-xs font-extrabold text-slate-800 dark:text-slate-100">
-                إضافة إجمالي الأعداد في آخر سطر
-              </span>
-              <input
-                type="checkbox"
-                checked={noteCopyIncludeTotalQuantities}
-                onChange={(e) =>
-                  onUpdateNoteSettings?.({
-                    noteCopyIncludeTotalQuantities: e.target.checked,
-                  })
-                }
-                className="w-5 h-5 accent-emerald-500 rounded"
-              />
-            </label>
-          </div>
-        </div>
-      )}
-
-      {/* Quick Note Settings Sheet ("إعدادات الملاحظات") */}
-      {showNoteSettingsSheet && (
-        <div
-          className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4"
-          dir="rtl"
-          onClick={() => setShowNoteSettingsSheet(false)}
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            className="bg-white dark:bg-slate-900 w-full max-w-md rounded-t-[24px] sm:rounded-[20px] px-4 pt-4 pb-[calc(1rem+env(safe-area-inset-bottom,0px))] shadow-2xl border border-slate-200 dark:border-slate-800 space-y-2.5"
-          >
-            <div className="flex items-center justify-between pb-1">
-              <div className="flex items-center gap-2">
-                <Settings2 className="w-5 h-5 text-emerald-500" />
-                <h3 className="text-base font-extrabold text-slate-900 dark:text-white">
-                  إعدادات الملاحظات
-                </h3>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowNoteSettingsSheet(false)}
-                className="w-10 h-10 rounded-xl bg-[#F7F8FA] dark:bg-slate-800 text-slate-500 flex items-center justify-center"
-                aria-label="إغلاق"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <label className="flex items-center justify-between gap-3 p-3 rounded-2xl bg-[#F7F8FA] dark:bg-slate-800 cursor-pointer">
-              <span className="text-xs font-extrabold text-slate-800 dark:text-slate-100">
-                الكميات في الملاحظات الجديدة
-              </span>
-              <input
-                type="checkbox"
-                checked={defaultNoteQuantities}
-                onChange={(e) =>
-                  onUpdateNoteSettings?.({
-                    defaultNoteQuantities: e.target.checked,
-                  })
-                }
-                className="w-5 h-5 accent-emerald-500 rounded"
-              />
-            </label>
-
-            <label className="flex items-center justify-between gap-3 p-3 rounded-2xl bg-[#F7F8FA] dark:bg-slate-800 cursor-pointer">
-              <span className="text-xs font-extrabold text-slate-800 dark:text-slate-100">
-                ترقيم الملاحظات الجديدة تلقائياً
-              </span>
-              <input
-                type="checkbox"
-                checked={defaultNoteNumbering}
-                onChange={(e) =>
-                  onUpdateNoteSettings?.({
-                    defaultNoteNumbering: e.target.checked,
-                  })
-                }
-                className="w-5 h-5 accent-emerald-500 rounded"
-              />
-            </label>
-
-            <label className="flex items-center justify-between gap-3 p-3 rounded-2xl bg-[#F7F8FA] dark:bg-slate-800 cursor-pointer">
-              <span className="text-xs font-extrabold text-slate-800 dark:text-slate-100">
-                إضافة المجموع الحسابي في رسالة واتساب
-              </span>
-              <input
-                type="checkbox"
-                checked={includeTotalInWhatsApp}
-                onChange={(e) => onToggleIncludeTotalInWhatsApp(e.target.checked)}
-                className="w-5 h-5 accent-emerald-500 rounded"
-              />
-            </label>
-          </div>
-        </div>
-      )}
+      {/* Single Consolidated Note Settings Sheet ("إعدادات الملاحظات") */}
+      <NoteSettingsSheet
+        open={showNoteSettingsSheet}
+        onClose={() => setShowNoteSettingsSheet(false)}
+        noteCopySortOrder={noteCopySortOrder}
+        noteCopyDigitStyle={noteCopyDigitStyle}
+        noteCopyIncludeTotalQuantities={noteCopyIncludeTotalQuantities}
+        includeTotalInWhatsApp={includeTotalInWhatsApp}
+        defaultNoteQuantities={defaultNoteQuantities}
+        defaultNoteNumbering={defaultNoteNumbering}
+        autoTakeNoteNumber={autoTakeNoteNumber}
+        noteUnitMode={noteUnitMode}
+        noteDefaultUnit={noteDefaultUnit}
+        onUpdateNoteSettings={(partial) => {
+          if (typeof partial.includeTotalInWhatsApp === 'boolean') {
+            onToggleIncludeTotalInWhatsApp(partial.includeTotalInWhatsApp);
+          }
+          onUpdateNoteSettings?.(partial);
+        }}
+        onUnitMemoryCleared={() => showTopUnitNotice('تم مسح ذاكرة الوحدات')}
+      />
     </div>
   );
 };

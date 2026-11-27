@@ -1,25 +1,38 @@
 import { useEffect, useState } from 'react';
-import { registerSW } from 'virtual:pwa-register';
+import { shouldRegisterServiceWorker } from './pwaDiagnostics';
 
 export interface OfflineSWState {
   swSupported: boolean;
+  swRegistered: boolean;
+  swActive: boolean;
   offlineReady: boolean;
   updateAvailable: boolean;
+  lastError: string | null;
 }
 
+const hasSWApi =
+  typeof navigator !== 'undefined' && 'serviceWorker' in navigator;
+
 let currentState: OfflineSWState = {
-  swSupported:
-    typeof navigator !== 'undefined' && 'serviceWorker' in navigator,
-  offlineReady:
-    typeof navigator !== 'undefined' &&
-    'serviceWorker' in navigator &&
-    Boolean(navigator.serviceWorker.controller),
+  swSupported: hasSWApi,
+  swRegistered: false,
+  swActive: Boolean(hasSWApi && navigator.serviceWorker.controller),
+  offlineReady: Boolean(hasSWApi && navigator.serviceWorker.controller),
   updateAvailable: false,
+  lastError: null,
 };
 
 let initialized = false;
-let updateSWFn: ((reloadPage?: boolean) => Promise<void>) | null = null;
+let waitingWorkerRef: ServiceWorker | null = null;
 const listeners = new Set<(state: OfflineSWState) => void>();
+
+function formatError(err: unknown): string {
+  if (err instanceof Error) {
+    return `${err.name}: ${err.message}`.trim();
+  }
+  if (typeof err === 'string') return err;
+  return 'خطأ غير معروف';
+}
 
 function emit(partial: Partial<OfflineSWState>) {
   currentState = { ...currentState, ...partial };
@@ -28,82 +41,110 @@ function emit(partial: Partial<OfflineSWState>) {
   }
 }
 
+export function recordPwaLastError(err: unknown): void {
+  const msg = formatError(err);
+  emit({ lastError: msg });
+}
+
+export function getLastPwaError(): string | null {
+  return currentState.lastError;
+}
+
+export function triggerWaitingServiceWorkerReload(): void {
+  if (waitingWorkerRef) {
+    try {
+      waitingWorkerRef.postMessage({ type: 'SKIP_WAITING' });
+    } catch {
+      // Fallback to regular reload
+    }
+  }
+  if (typeof window !== 'undefined') {
+    window.location.reload();
+  }
+}
+
+function attachRegistrationListeners(reg: ServiceWorkerRegistration): void {
+  const syncFromReg = () => {
+    const active = Boolean(
+      (reg.active && reg.active.state === 'activated') ||
+        (hasSWApi && navigator.serviceWorker.controller)
+    );
+    const waiting = Boolean(
+      reg.waiting && hasSWApi && navigator.serviceWorker.controller
+    );
+    if (reg.waiting) {
+      waitingWorkerRef = reg.waiting;
+    }
+    emit({
+      swRegistered: true,
+      swActive: active,
+      offlineReady: active,
+      updateAvailable: waiting || Boolean(reg.waiting && reg.active),
+    });
+  };
+
+  syncFromReg();
+
+  const watchWorker = (worker: ServiceWorker | null) => {
+    if (!worker) return;
+    worker.addEventListener('statechange', () => {
+      if (worker.state === 'installed' && hasSWApi && navigator.serviceWorker.controller) {
+        waitingWorkerRef = worker;
+        emit({ updateAvailable: true });
+      }
+      if (worker.state === 'activated') {
+        emit({
+          swRegistered: true,
+          swActive: true,
+          offlineReady: true,
+        });
+      }
+    });
+  };
+
+  watchWorker(reg.installing);
+  watchWorker(reg.waiting);
+
+  reg.addEventListener('updatefound', () => {
+    watchWorker(reg.installing);
+  });
+}
+
 export function initOfflineServiceWorker(): void {
   if (initialized) return;
   initialized = true;
 
-  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
-    emit({ swSupported: false, offlineReady: false });
+  if (!hasSWApi) {
+    emit({ swSupported: false, swRegistered: false, swActive: false, offlineReady: false });
     return;
   }
 
-  // In development/preview, unregister any stale dev service worker so Vite ES modules are never cached stale across server restarts
-  if (!import.meta.env.PROD) {
-    navigator.serviceWorker
-      .getRegistrations()
-      .then(async (regs) => {
-        let hadDevSw = false;
-        for (const reg of regs) {
-          const url = reg.active?.scriptURL || reg.installing?.scriptURL || reg.waiting?.scriptURL || '';
-          if (url.includes('dev-sw') || url.includes('sw.js')) {
-            hadDevSw = true;
-            await reg.unregister().catch(() => {});
-          }
-        }
-        if (hadDevSw && typeof caches !== 'undefined') {
-          const keys = await caches.keys().catch(() => [] as string[]);
-          await Promise.all(
-            keys
-              .filter((k) => k.includes('workbox') || k.includes('app-runtime'))
-              .map((k) => caches.delete(k).catch(() => false))
-          );
-        }
-      })
-      .catch(() => {});
-    return;
-  }
-
-  try {
-    updateSWFn = registerSW({
-      immediate: true,
-      onOfflineReady() {
-        emit({ offlineReady: true });
-      },
-      onNeedRefresh() {
-        emit({ updateAvailable: true });
-        if (updateSWFn) {
-          updateSWFn(true).catch(() => {});
-        }
-      },
-      onRegisteredSW(_swUrl, registration) {
-        if (registration?.active || navigator.serviceWorker.controller) {
-          emit({ offlineReady: true });
-        }
-        registration?.addEventListener('updatefound', () => {
-          const worker = registration.installing;
-          if (!worker) return;
-          worker.addEventListener('statechange', () => {
-            if (worker.state === 'activated') {
-              emit({ offlineReady: true });
-            }
-          });
-        });
-      },
-      onRegisterError() {
-        // Keep silent; app still falls back to browser HTTP/IndexedDB storage
-      },
+  if (typeof window === 'undefined') return;
+  const { protocol, hostname } = window.location;
+  if (!shouldRegisterServiceWorker(protocol, hostname)) {
+    emit({
+      swSupported: true,
+      swRegistered: false,
+      swActive: false,
+      offlineReady: false,
+      lastError: `التسجيل يتطلب HTTPS أو localhost (${protocol})`,
     });
-
-    navigator.serviceWorker.ready
-      .then((reg) => {
-        if (reg.active) {
-          emit({ offlineReady: true });
-        }
-      })
-      .catch(() => {});
-  } catch {
-    // Ignore SW registration errors on restricted origins
+    return;
   }
+
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    emit({ swRegistered: true, swActive: true, offlineReady: true });
+  });
+
+  navigator.serviceWorker
+    .register('/sw.js', { scope: '/' })
+    .then((reg) => {
+      attachRegistrationListeners(reg);
+    })
+    .catch((err) => {
+      // Fail silently on restricted contexts; keep error for diagnostics only
+      recordPwaLastError(err);
+    });
 }
 
 export function useOfflineSWStatus(): OfflineSWState {

@@ -79,10 +79,49 @@ export function formatQuantityDigits(
   return digitStyle === 'arabic' ? toArabicIndicDigits(base) : base;
 }
 
+export const NOTE_QUANTITY_UNIT_OPTIONS: ReadonlyArray<{
+  id: NoteQuantityUnit;
+  label: string;
+}> = [
+  { id: 'carton', label: 'كارتون' },
+  { id: 'box', label: 'علبة' },
+  { id: 'piece', label: 'قطع' },
+  { id: 'kg', label: 'كيلو' },
+  { id: 'gram', label: 'غرام' },
+];
+
 export function formatQuantityUnitLabel(unit?: NoteQuantityUnit): string {
   if (unit === 'carton') return 'كارتون';
+  if (unit === 'box') return 'علبة';
   if (unit === 'piece') return 'قطع';
+  if (unit === 'kg') return 'كيلو';
+  if (unit === 'gram') return 'غرام';
   return '';
+}
+
+const AUTO_TAKE_UNIT_WORD_MAP: Record<string, NoteQuantityUnit> = {
+  كارتون: 'carton',
+  carton: 'carton',
+  علبة: 'box',
+  علبه: 'box',
+  box: 'box',
+  قطعة: 'piece',
+  قطعه: 'piece',
+  قطع: 'piece',
+  pcs: 'piece',
+  كيلو: 'kg',
+  kg: 'kg',
+  غرام: 'gram',
+  g: 'gram',
+};
+
+export function parseAutoTakeUnitWord(token: string): NoteQuantityUnit | null {
+  if (!token) return null;
+  const cleaned = token
+    .replace(/[\u064B-\u065F\u0670\u0640]/g, '')
+    .trim()
+    .toLowerCase();
+  return AUTO_TAKE_UNIT_WORD_MAP[cleaned] ?? null;
 }
 
 /**
@@ -132,6 +171,101 @@ export function extractTrailingQuantity(
   return {
     cleanName: before,
     quantity,
+  };
+}
+
+/**
+ * Auto-take parser invoked ONLY when finishing a line with "أخذ الرقم تلقائياً" ON:
+ * - Extracts trailing `<number>` or `<number><unit word>` (spaced or attached) when
+ *   unit word is one of: كارتون، علبة، قطعة، قطع، كيلو، غرام (or carton, box, pcs, kg, g).
+ * - Accepts attached forms like "تفاح2", "تفاح٢", "تفاح x2", "تفاح ×2", "تفاح *2",
+ *   "تفاح:2", "تفاح=2", and "عصير5قطع" / "عصير 5 قطع".
+ * - Accepts Western, Arabic-Indic (٠-٩), and Eastern Arabic (۰-۹) digits.
+ * - Decimals are allowed ONLY when unit is كيلو ('kg') or غرام ('gram').
+ * - Keeps numbers in the name when letters or unit abbreviations follow them
+ *   ("200غ", "350مل", "1.5ل", "7up"), when not at the end, or in calculator lines.
+ */
+export function extractAutoTakeQuantityAndUnit(
+  rawLine: string
+): { cleanName: string; quantity: number; unit?: NoteQuantityUnit } | null {
+  if (!rawLine || !rawLine.trim()) return null;
+  if (!HAS_LETTER_REGEX.test(rawLine)) return null;
+  if (parseNoteLineMath(rawLine).hasExpression) return null;
+
+  const trimmed = rawLine.trimEnd();
+  let coreBeforeUnit = trimmed;
+  let unit: NoteQuantityUnit | undefined;
+
+  // Check if line ends with non-digit letters directly after digits (e.g. "عصير5قطع", "عصير 5 قطع", "جبن 200غ", "7up")
+  const trailingLettersMatch = trimmed.match(
+    /^(.*?[0-9\u0660-\u0669\u06F0-\u06F9])\s*([^\s0-9\u0660-\u0669\u06F0-\u06F9]+)$/u
+  );
+  if (trailingLettersMatch) {
+    const parsedUnit = parseAutoTakeUnitWord(trailingLettersMatch[2]);
+    if (!parsedUnit) {
+      // Letters or unit abbreviation right after number (e.g. "200غ", "350مل", "1.5ل", "7up") -> keep in name
+      return null;
+    }
+    unit = parsedUnit;
+    coreBeforeUnit = trailingLettersMatch[1];
+    // Reject calculator expressions followed by a unit word (e.g. "حليب 6 * 12 قطع")
+    if (parseNoteLineMath(coreBeforeUnit).hasExpression) {
+      return null;
+    }
+  }
+
+  // Extract trailing number token (non-digit/non-decimal-dot char must precede the number start)
+  const numMatch = coreBeforeUnit.match(
+    /^(.*[^0-9\u0660-\u0669\u06F0-\u06F9.\u066B,])([0-9\u0660-\u0669\u06F0-\u06F9]+(?:[.\u066B,][0-9\u0660-\u0669\u06F0-\u06F9]+)?)$/u
+  );
+  if (!numMatch) return null;
+
+  const rawBefore = numMatch[1];
+  const rawNum = numMatch[2];
+
+  // Decimals are allowed ONLY when the unit is كيلو ('kg') or غرام ('gram')
+  const hasDecimal = /[.\u066B,]/.test(rawNum);
+  if (hasDecimal && unit !== 'kg' && unit !== 'gram') {
+    return null;
+  }
+
+  let beforeClean = rawBefore.trimEnd();
+  if (!beforeClean) return null;
+
+  // Reject arithmetic operators other than allowed trailing separators (x, ×, *, :, =)
+  const lastCharBefore = beforeClean[beforeClean.length - 1];
+  if (/[+\-/÷([{]/.test(lastCharBefore)) {
+    return null;
+  }
+
+  // Strip allowed trailing separators: ×, *, :, = (or 'x'/'X' when not inside a Latin word like "box2")
+  if (/[×*:=]/.test(lastCharBefore)) {
+    beforeClean = beforeClean.slice(0, -1).trimEnd();
+  } else if (lastCharBefore === 'x' || lastCharBefore === 'X') {
+    const charBeforeX =
+      beforeClean.length >= 2 ? beforeClean[beforeClean.length - 2] : '';
+    if (!charBeforeX || !/[A-Za-z]/.test(charBeforeX)) {
+      beforeClean = beforeClean.slice(0, -1).trimEnd();
+    }
+  }
+
+  const cleanName = beforeClean.trim();
+  if (!cleanName || !HAS_LETTER_REGEX.test(cleanName)) {
+    return null;
+  }
+
+  // Ensure stripping to `cleanName` doesn't mask a math expression
+  if (parseNoteLineMath(`${cleanName} ${rawNum}`).hasExpression) {
+    return null;
+  }
+
+  const quantity = parseQuantityNumberInput(rawNum);
+  if (quantity === null) return null;
+
+  return {
+    cleanName,
+    quantity,
+    ...(unit ? { unit } : {}),
   };
 }
 

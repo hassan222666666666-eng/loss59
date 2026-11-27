@@ -3,6 +3,7 @@ import { compressCoverBlobToDataUrl } from './coverArt';
 import {
   addAudioFilesToLibrary,
   addRadioStationToLibrary,
+  addTracksToMusicList,
   clearMusicLibrary,
   createMusicList,
   DEFAULT_PLAYBACK_STATE,
@@ -41,6 +42,7 @@ import {
 } from './musicPlaybackHelpers';
 import { setMusicPlayingActive } from './musicPlaybackFlag';
 import {
+  MusicAddFilesResult,
   MusicCustomList,
   MusicImportProgress,
   MusicImportReport,
@@ -61,6 +63,7 @@ interface UseMusicPlayerParams {
   refreshSignal: number;
   visualEffects?: boolean;
   audioReactive?: boolean;
+  pauseReactiveSampling?: boolean;
 }
 
 const VOLUME_RESET_STORAGE_KEY = 'naqs_music_volume_reset_v1';
@@ -100,6 +103,7 @@ export function useMusicPlayer({
   refreshSignal,
   visualEffects = true,
   audioReactive = false,
+  pauseReactiveSampling = false,
 }: UseMusicPlayerParams) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const objectUrlRef = useRef<string | null>(null);
@@ -387,9 +391,15 @@ export function useMusicPlayer({
     }
   }, [enabled, clearMediaSession, clearSkipTimer, revokeAllObjectUrls]);
 
-  // Opt-in AnalyserNode loop: NEVER created unless audioReactive === true AND playing
+  // Opt-in AnalyserNode loop: NEVER created unless audioReactive === true AND playing AND not paused for Capture tab
   useEffect(() => {
-    if (!enabled || !audioReactive || !visualEffects || !isPlaying) {
+    if (
+      !enabled ||
+      !audioReactive ||
+      !visualEffects ||
+      !isPlaying ||
+      pauseReactiveSampling
+    ) {
       if (reactiveRafRef.current !== null) {
         window.cancelAnimationFrame(reactiveRafRef.current);
         reactiveRafRef.current = null;
@@ -502,7 +512,7 @@ export function useMusicPlayer({
         reactiveRafRef.current = null;
       }
     };
-  }, [enabled, audioReactive, visualEffects, isPlaying]);
+  }, [enabled, audioReactive, visualEffects, isPlaying, pauseReactiveSampling]);
 
   // Detect background playback interruption while audioReactive is enabled
   useEffect(() => {
@@ -554,38 +564,78 @@ export function useMusicPlayer({
       return;
     }
 
-    const tick = () => {
+    let expireTimerId: number | null = null;
+    let displayTimerId: number | null = null;
+    let finished = false;
+
+    const handleExpire = () => {
+      if (finished) return;
+      finished = true;
+      if (displayTimerId !== null) window.clearTimeout(displayTimerId);
+      setSleepTimerMinutes(null);
+      setSleepTimerEndsAt(null);
+      setSleepRemainingSec(0);
+      if (audioRef.current && !audioRef.current.paused) {
+        expectedPauseRef.current = true;
+        audioRef.current.pause();
+        setIsPlaying(false);
+        setIsBuffering(false);
+        setMusicPlayingActive(false);
+        const pos = Number.isFinite(audioRef.current.currentTime)
+          ? audioRef.current.currentTime
+          : 0;
+        const curId = currentTrackIdRef.current;
+        if (curId) {
+          trackPositionsRef.current[curId] = pos;
+        }
+        saveMusicPlaybackState({
+          positionSec: pos,
+          trackPositions: { ...trackPositionsRef.current },
+        }).catch(() => {});
+      }
+      showToast('info', 'انتهى مؤقّت النوم وتم إيقاف التشغيل');
+    };
+
+    const scheduleDisplayUpdate = () => {
+      if (finished) return;
       const remaining = computeSleepTimerRemainingSec(sleepTimerEndsAt, Date.now());
       setSleepRemainingSec(remaining);
       if (remaining <= 0) {
-        setSleepTimerMinutes(null);
-        setSleepTimerEndsAt(null);
-        setSleepRemainingSec(0);
-        if (audioRef.current && !audioRef.current.paused) {
-          expectedPauseRef.current = true;
-          audioRef.current.pause();
-          setIsPlaying(false);
-          setIsBuffering(false);
-          setMusicPlayingActive(false);
-          const pos = Number.isFinite(audioRef.current.currentTime)
-            ? audioRef.current.currentTime
-            : 0;
-          const curId = currentTrackIdRef.current;
-          if (curId) {
-            trackPositionsRef.current[curId] = pos;
-          }
-          saveMusicPlaybackState({
-            positionSec: pos,
-            trackPositions: { ...trackPositionsRef.current },
-          }).catch(() => {});
-        }
-        showToast('info', 'انتهى مؤقّت النوم وتم إيقاف التشغيل');
+        handleExpire();
+        return;
+      }
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+        displayTimerId = window.setTimeout(scheduleDisplayUpdate, 1000);
       }
     };
 
-    tick();
-    const id = window.setInterval(tick, 500);
-    return () => window.clearInterval(id);
+    const remainingMs = Math.max(0, sleepTimerEndsAt - Date.now());
+    if (remainingMs === 0) {
+      handleExpire();
+      return;
+    }
+
+    expireTimerId = window.setTimeout(handleExpire, remainingMs);
+    scheduleDisplayUpdate();
+
+    const onVisibility = () => {
+      if (finished) return;
+      if (document.visibilityState === 'visible') {
+        if (displayTimerId !== null) window.clearTimeout(displayTimerId);
+        scheduleDisplayUpdate();
+      } else if (displayTimerId !== null) {
+        window.clearTimeout(displayTimerId);
+        displayTimerId = null;
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+
+    return () => {
+      finished = true;
+      document.removeEventListener('visibilitychange', onVisibility);
+      if (expireTimerId !== null) window.clearTimeout(expireTimerId);
+      if (displayTimerId !== null) window.clearTimeout(displayTimerId);
+    };
   }, [enabled, sleepTimerEndsAt, showToast]);
 
   useEffect(() => {
@@ -1032,6 +1082,25 @@ export function useMusicPlayer({
     }).catch(() => {});
   }, []);
 
+  const resetVolume = useCallback(() => {
+    setVolumeState(1);
+    volumeRef.current = 1;
+    setIsMutedState(false);
+    isMutedRef.current = false;
+    setLastNonZeroVolume(1);
+    lastNonZeroVolumeRef.current = 1;
+    if (audioRef.current) {
+      audioRef.current.volume = 1;
+      audioRef.current.muted = false;
+    }
+    saveMusicPlaybackState({
+      volume: 1,
+      muted: false,
+      lastNonZeroVolume: 1,
+    }).catch(() => {});
+    showToast('info', 'تم إعادة ضبط مستوى الصوت إلى 100%');
+  }, [showToast]);
+
   const toggleShuffle = useCallback(() => {
     const next = !shuffleRef.current;
     setShuffleState(next);
@@ -1350,6 +1419,23 @@ export function useMusicPlayer({
   // Library mutations (sequential non-blocking import with duplicate check & progress)
   const addFiles = useCallback(
     async (files: File[]) => {
+      if (importBusyRef.current) {
+        return {
+          addedTracks: [],
+          reattachedTracks: [],
+          rejectedOverLimit: false,
+          skippedInvalid: 0,
+          skippedDuplicatesCount: 0,
+          skippedDuplicateFiles: [],
+          failedCount: 0,
+          failedFiles: [],
+          cancelled: false,
+          summaryText: 'عملية إضافة أخرى قيد التنفيذ حالياً',
+          usedBytes: storageStats.usedBytes,
+          persisted: storageStats.persisted,
+        } satisfies MusicAddFilesResult;
+      }
+
       const capMb = maxStorageMb > 0 ? maxStorageMb : DEFAULT_MUSIC_MAX_STORAGE_MB;
       const wasPlayingBeforeImport = isPlayingRef.current;
 
@@ -1380,6 +1466,7 @@ export function useMusicPlayer({
       setImportReport({
         addedCount: countAdded,
         skippedDuplicatesCount: result.skippedDuplicatesCount,
+        skippedDuplicateFiles: result.skippedDuplicateFiles,
         failedCount: result.failedCount,
         cancelled: result.cancelled,
         failedFiles: result.failedFiles,
@@ -1387,7 +1474,14 @@ export function useMusicPlayer({
       });
 
       if (countAdded > 0) {
-        showToast('info', `تمت إضافة ${countAdded} ملف صوتي للمكتبة`);
+        if (result.skippedDuplicatesCount > 0) {
+          showToast(
+            'info',
+            `تمت إضافة ${countAdded} مقطع · تم منع تكرار ${result.skippedDuplicatesCount}`
+          );
+        } else {
+          showToast('info', `تمت إضافة ${countAdded} ملف صوتي للمكتبة`);
+        }
         const firstNewTrack =
           result.addedTracks[0] || result.reattachedTracks[0] || null;
         if (firstNewTrack && !wasPlayingBeforeImport && !isPlayingRef.current) {
@@ -1395,12 +1489,26 @@ export function useMusicPlayer({
         }
       } else if (result.rejectedOverLimit && result.rejectedReason) {
         showToast('error', result.rejectedReason);
+      } else if (result.skippedDuplicatesCount > 0 && result.failedCount === 0) {
+        showToast(
+          'info',
+          result.skippedDuplicatesCount === 1
+            ? 'هذا المقطع مضاف مسبقاً، تم منع تكراره'
+            : `تم منع إضافة ${result.skippedDuplicatesCount} مقطع مكرر (موجود مسبقاً)`
+        );
       } else if (result.skippedDuplicatesCount > 0 || result.failedCount > 0) {
         showToast('info', result.summaryText);
       }
       return result;
     },
-    [loadAndPlayTrack, maxStorageMb, refreshLibrary, showToast]
+    [
+      loadAndPlayTrack,
+      maxStorageMb,
+      refreshLibrary,
+      showToast,
+      storageStats.persisted,
+      storageStats.usedBytes,
+    ]
   );
 
   const cancelImport = useCallback(() => {
@@ -1486,6 +1594,20 @@ export function useMusicPlayer({
       await refreshLibrary();
     },
     [refreshLibrary]
+  );
+
+  const addTracksToList = useCallback(
+    async (listId: string, trackIds: string[]) => {
+      const added = await addTracksToMusicList(trackIds, listId);
+      await refreshLibrary();
+      if (added > 0) {
+        showToast('info', `تمت إضافة ${added} مقطع إلى القائمة`);
+      } else {
+        showToast('info', 'المقاطع المحددة مضافة للقائمة مسبقاً');
+      }
+      return added;
+    },
+    [refreshLibrary, showToast]
   );
 
   const createList = useCallback(
@@ -1608,6 +1730,7 @@ export function useMusicPlayer({
     playPrev: () => advanceTrack('prev', false),
     seekTo,
     setVolume,
+    resetVolume,
     toggleMute,
     toggleShuffle,
     cycleRepeat,
@@ -1619,6 +1742,7 @@ export function useMusicPlayer({
     updateTrackCover,
     setTrackTileColor,
     toggleTrackInList,
+    addTracksToList,
     createList,
     renameList,
     deleteList,

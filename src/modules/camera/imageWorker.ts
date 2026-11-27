@@ -1,7 +1,19 @@
 /**
- * Web Worker for off-thread camera capture resizing, orientation baking,
- * EXIF-free JPEG encoding, and blur detection using createImageBitmap + OffscreenCanvas.
+ * Web Worker for off-thread camera capture orientation baking,
+ * thumbnail resizing, JPEG encoding (quality 0.92, max 4096px),
+ * blur detection (when requested), and IndexedDB persistence.
  */
+
+const DB_NAME = 'naqs_alrofoof_db';
+const DB_VERSION = 11;
+
+interface WorkerPhotoMeta {
+  id: string;
+  sessionId: string;
+  timestamp: number;
+  dateKey: string;
+  enhancementStatus?: 'pending';
+}
 
 interface WorkerProcessRequest {
   id: number;
@@ -11,7 +23,11 @@ interface WorkerProcessRequest {
   rotationDeg?: 0 | 90 | 180 | 270;
   maxDim: number;
   quality: number;
+  thumbnailMaxDim?: number;
+  thumbnailQuality?: number;
   blurThreshold: number;
+  saveToDb?: boolean;
+  photoMeta?: WorkerPhotoMeta;
 }
 
 function calcTargetDims(
@@ -20,7 +36,11 @@ function calcTargetDims(
   maxDim: number
 ): { width: number; height: number } {
   if (width <= 0 || height <= 0) return { width: 1, height: 1 };
-  if (!Number.isFinite(maxDim) || maxDim <= 0 || (width <= maxDim && height <= maxDim)) {
+  if (
+    !Number.isFinite(maxDim) ||
+    maxDim <= 0 ||
+    (width <= maxDim && height <= maxDim)
+  ) {
     return { width: Math.round(width), height: Math.round(height) };
   }
   if (width >= height) {
@@ -94,6 +114,64 @@ async function blobToJpegDataUrl(blob: Blob): Promise<string> {
   return `data:image/jpeg;base64,${btoa(binary)}`;
 }
 
+let workerDb: IDBDatabase | null = null;
+
+async function openWorkerDb(): Promise<IDBDatabase> {
+  if (workerDb) return workerDb;
+  if (typeof indexedDB === 'undefined') {
+    throw new Error('IndexedDB unavailable in worker');
+  }
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = (event) => {
+      const db = (event.target as IDBOpenDBRequest).result;
+      if (!db.objectStoreNames.contains('photos')) {
+        const photoStore = db.createObjectStore('photos', { keyPath: 'id' });
+        photoStore.createIndex('sessionId', 'sessionId', { unique: false });
+        photoStore.createIndex('dateKey', 'dateKey', { unique: false });
+        photoStore.createIndex('timestamp', 'timestamp', { unique: false });
+      }
+      if (!db.objectStoreNames.contains('notes')) {
+        const noteStore = db.createObjectStore('notes', { keyPath: 'id' });
+        noteStore.createIndex('updatedAt', 'updatedAt', { unique: false });
+      }
+      if (!db.objectStoreNames.contains('settings')) {
+        db.createObjectStore('settings', { keyPath: 'key' });
+      }
+    };
+    req.onsuccess = () => {
+      workerDb = req.result;
+      workerDb.onclose = () => {
+        workerDb = null;
+      };
+      resolve(workerDb);
+    };
+    req.onerror = () => {
+      reject(req.error || new Error('Failed to open IndexedDB in worker'));
+    };
+  });
+}
+
+async function savePhotoRecordInWorker(record: {
+  id: string;
+  sessionId: string;
+  timestamp: number;
+  dateKey: string;
+  dataUrl: string;
+  thumbnailDataUrl: string;
+  width: number;
+  height: number;
+  enhancementStatus?: 'pending';
+}): Promise<void> {
+  const db = await openWorkerDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction('photos', 'readwrite');
+    tx.objectStore('photos').put(record);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error('Worker IDB put failed'));
+  });
+}
+
 const workerScope = self as unknown as {
   addEventListener: (
     type: 'message',
@@ -111,11 +189,17 @@ workerScope.addEventListener('message', async (event) => {
     rotationDeg = 0,
     maxDim,
     quality,
+    thumbnailMaxDim = 480,
+    thumbnailQuality = 0.8,
     blurThreshold,
+    saveToDb = false,
+    photoMeta,
   } = event.data;
 
   let bitmap: ImageBitmap | null = incomingBitmap || null;
   try {
+    const procStart = performance.now();
+
     if (!bitmap && blob) {
       bitmap = await createUprightBitmapFromBlob(blob);
     }
@@ -203,11 +287,22 @@ workerScope.addEventListener('message', async (event) => {
     }
     outCtx.restore();
 
+    // Release input bitmap ASAP before encoding
+    try {
+      bitmap.close();
+    } catch {
+      // Ignore close error
+    }
+    bitmap = null;
+
     let variance = 100;
     let isBlurry = false;
     if (blurThreshold > 0) {
       const blurW = Math.min(200, target.width);
-      const blurH = Math.max(12, Math.round((target.height * blurW) / target.width));
+      const blurH = Math.max(
+        12,
+        Math.round((target.height * blurW) / target.width)
+      );
       const blurCanvas = new OffscreenCanvas(blurW, blurH);
       const blurCtx = blurCanvas.getContext('2d', { willReadFrequently: true });
       if (blurCtx) {
@@ -215,25 +310,99 @@ workerScope.addEventListener('message', async (event) => {
         const px = blurCtx.getImageData(0, 0, blurW, blurH).data;
         const gray = new Uint8Array(blurW * blurH);
         for (let i = 0, p = 0; i < px.length; i += 4, p++) {
-          gray[p] = Math.round(0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2]);
+          gray[p] = Math.round(
+            0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2]
+          );
         }
-        variance = Math.round(computeLaplacianVar(gray, blurW, blurH) * 10) / 10;
+        variance =
+          Math.round(computeLaplacianVar(gray, blurW, blurH) * 10) / 10;
         isBlurry = variance < blurThreshold;
       }
     }
 
+    // Encode full-resolution JPEG (quality 0.92, long side <= 4096px)
     const jpegBlob = await outCanvas.convertToBlob({
       type: 'image/jpeg',
       quality,
     });
+    const byteLength = jpegBlob.size;
     const dataUrl = await blobToJpegDataUrl(jpegBlob);
+
+    // Resize separate lightweight thumbnail off the main thread
+    let thumbnailDataUrl = dataUrl;
+    const thumbDims = calcTargetDims(
+      target.width,
+      target.height,
+      thumbnailMaxDim
+    );
+    if (
+      thumbDims.width < target.width ||
+      thumbDims.height < target.height
+    ) {
+      const thumbCanvas = new OffscreenCanvas(
+        thumbDims.width,
+        thumbDims.height
+      );
+      const thumbCtx = thumbCanvas.getContext('2d');
+      if (thumbCtx) {
+        thumbCtx.imageSmoothingEnabled = true;
+        thumbCtx.imageSmoothingQuality = 'high';
+        thumbCtx.drawImage(
+          outCanvas,
+          0,
+          0,
+          thumbDims.width,
+          thumbDims.height
+        );
+        const thumbBlob = await thumbCanvas.convertToBlob({
+          type: 'image/jpeg',
+          quality: thumbnailQuality,
+        });
+        thumbnailDataUrl = await blobToJpegDataUrl(thumbBlob);
+      }
+    }
+
+    const processingMs = Math.max(1, Math.round(performance.now() - procStart));
+
+    let savingMs = 0;
+    let savedInWorker = false;
+    if (saveToDb && photoMeta) {
+      const saveStart = performance.now();
+      try {
+        await savePhotoRecordInWorker({
+          id: photoMeta.id,
+          sessionId: photoMeta.sessionId,
+          timestamp: photoMeta.timestamp,
+          dateKey: photoMeta.dateKey,
+          dataUrl,
+          thumbnailDataUrl,
+          width: target.width,
+          height: target.height,
+          ...(photoMeta.enhancementStatus
+            ? { enhancementStatus: photoMeta.enhancementStatus }
+            : {}),
+        });
+        savingMs = Math.max(1, Math.round(performance.now() - saveStart));
+        savedInWorker = true;
+      } catch {
+        // Return full dataUrl so main thread can fallback to savePhoto
+        savingMs = 0;
+        savedInWorker = false;
+      }
+    }
 
     workerScope.postMessage({
       id,
       ok: true,
-      dataUrl,
+      dataUrl: savedInWorker ? '' : dataUrl,
+      thumbnailDataUrl: savedInWorker ? '' : thumbnailDataUrl,
       width: target.width,
       height: target.height,
+      byteLength,
+      processingMs,
+      savingMs,
+      savedInWorker,
+      photoId: photoMeta?.id,
       variance,
       isBlurry,
     });

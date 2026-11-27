@@ -1,11 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import {
+  IFRAME_INSTALL_WARNING_TEXT,
+  buildPwaDiagnosticsRows,
+  formatPwaDiagnosticsClipboardText,
+  shouldRegisterServiceWorker,
+  validateManifestPayload,
+} from '../pwa/pwaDiagnostics';
 import { computeLaplacianVariance } from '../modules/camera/blurDetection';
 import {
   calculateTargetDimensions,
   getVideoCaptureRotationDeg,
 } from '../modules/camera/imageCompression';
+import { computeStorageBreakdown } from '../modules/db/storageStats';
 import {
+  AUTO_FLASH_DEFAULTS,
   computeBrightnessMetricsFromRgba,
   createInitialAutoFlashState,
   isSceneDimForTorch,
@@ -30,9 +41,20 @@ import {
   computeToolbarVisibleCount,
   convertExistingNoteLinesToQuantities,
   countConvertibleTrailingLines,
+  extractAutoTakeQuantityAndUnit,
   extractTrailingQuantity,
+  formatQuantityUnitLabel,
   realignLineQuantitiesAfterEdit,
 } from '../modules/notes/quantityLogic';
+import {
+  SimpleStorageLike,
+  clearProductUnitMemory,
+  forgetUnitForProduct,
+  loadProductUnitMemory,
+  normalizeProductNameForUnitMemory,
+  rememberUnitForProduct,
+  resolveQuantityUnit,
+} from '../modules/notes/unitMemory';
 import {
   buildWhatsAppSchemeUrl,
   buildWhatsAppUrl,
@@ -73,6 +95,7 @@ import {
 } from './arabicText';
 import {
   CAMERA_RETRY_DELAYS_MS,
+  CAMERA_TAKE_PHOTO_TIMEOUT_MS,
   CAMERA_ZOOM_FOCUS_SETTLE_MS,
   acquireStreamWithTimeout,
   buildCameraConstraintAttempts,
@@ -90,6 +113,64 @@ import {
   formatCameraDiagnosticsClipboardText,
 } from '../modules/camera/cameraDiagnostics';
 import {
+  ADAPTIVE_FPS_LOW_THRESHOLD,
+  ADAPTIVE_FPS_SUSTAIN_MS,
+  PERF_TEST_DURATION_MS,
+  buildCameraPerfReport,
+  computeVideoFrameStats,
+  createAdaptivePreviewState,
+  formatPerfReportText,
+  getTargetPreviewDims,
+  resolvePreviewResolutionSetting,
+  stepAdaptivePreviewState,
+  summarizeLongTasks,
+} from '../modules/camera/cameraPerf';
+import {
+  ENHANCEMENT_IDLE_PAUSE_MS,
+  SHUTTER_BACKGROUND_PAUSE_MS,
+  __configureBackgroundQueueForTest,
+  enqueueBatchedPhotoWrite,
+  flushPendingPhotoWritesNow,
+  getRemainingEnhancementIdleMs,
+  getRemainingShutterPauseMs,
+  isBatterySaverQueuePaused,
+  notifyCameraActivity,
+  notifyShutterPressed,
+  runExclusiveWorkerTask,
+  setBatterySaverActive,
+  setCaptureTabActive,
+  setPageHidden,
+  waitForBackgroundSlot,
+  waitForEnhancementSlot,
+} from '../modules/camera/backgroundCameraQueue';
+import {
+  __resetSessionPowerTrackerForTest,
+  buildBatteryMeasurementRows,
+  evaluateBatterySaverActive,
+  formatBatteryMeasurementClipboardText,
+  formatSessionDurationArabic,
+  getEffectiveCameraPowerProfile,
+  getSessionCameraActiveMs,
+  getSessionCaptureCount,
+  incrementSessionCaptureCount,
+  markCameraSessionStarted,
+  markCameraSessionStopped,
+  resolveBatterySaverMode,
+  resolveCameraIdleTimeoutSec,
+  resolvePreviewFrameRateSetting,
+} from '../modules/power/batterySaver';
+import {
+  ENHANCE_TIMEOUT_MS,
+  accumulateTileStats,
+  applyToneAndColorInPlace,
+  computeEnhancementPlan,
+  createEmptyAnalyzeAccumulator,
+  enhanceRgbaBuffer,
+  finalizeImageStats,
+  formatEnhanceLevelLabel,
+  resolveEnhanceLevel,
+} from '../modules/camera/photoEnhancement';
+import {
   applyUnifiedTrackConstraints,
   buildUnifiedAdvancedConstraints,
   createDefaultCameraConstraintState,
@@ -97,10 +178,26 @@ import {
 } from '../modules/camera/cameraConstraints';
 import {
   areVideoDeviceLabelsEmpty,
+  clampHardwareZoom,
   extractZoomRangeFromCapabilities,
   pickBestTorchCandidate,
+  resolveAvailableZoomPresets,
   selectBackCameraCandidates,
 } from '../modules/camera/cameraSelection';
+import {
+  FREEZE_OVERLAY_MAX_MS,
+  MAX_CAPTURE_QUEUE_PENDING,
+  MAX_SAVED_PHOTO_LONG_SIDE,
+  SAVED_PHOTO_JPEG_QUALITY,
+  THUMBNAIL_JPEG_QUALITY,
+  THUMBNAIL_MAX_LONG_SIDE,
+  canAcceptCapture,
+  completePendingCapture,
+  computeFreezeDismissDelayMs,
+  enqueuePendingCapture,
+  formatCaptureModeLabel,
+  resolveCaptureMode,
+} from '../modules/camera/captureQueue';
 import {
   DEFAULT_MUSIC_MAX_STORAGE_MB,
   MISSING_FILE_LABEL,
@@ -111,6 +208,7 @@ import {
   buildMusicBackupTracks,
   canAddAudioBytes,
   clampFloatingButtonY,
+  computeAudioContentHash,
   computeSleepTimerRemainingSec,
   deriveShortTrackName,
   filterPlaylistTracks,
@@ -123,15 +221,23 @@ import {
   getRecentPlayedTracks,
   isBrowserStorageLow,
   isDuplicateAudioFile,
+  isDuplicateAudioTitleAndDuration,
+  isDuplicateRadioStation,
   isSupportedAudioFile,
   isValidRadioUrl,
   makeAudioDuplicateKey,
   mergeImportedMusicTracks,
+  normalizeAudioTitleForDuplicate,
+  normalizeRadioStreamUrl,
   pickNextTrackIndex,
   reorderTrackList,
   resolveMusicFabColorPreset,
   stripAudioFileExtension,
 } from '../modules/music/musicLogic';
+import {
+  AUDIO_PICKER_ACCEPT,
+  supportsDirectorySelection,
+} from '../modules/music/MusicAudioImporter';
 import {
   TRACK_TILE_COLORS,
   extractEmbeddedCoverArtBytes,
@@ -890,7 +996,7 @@ test('cameraConstraints builds single combined advanced payload and preserves to
   assert.ok(resErr.errorMessage?.includes('Torch rejected'));
 });
 
-test('cameraDiagnostics formats preview, saved photo, takePhoto, torch states, error, constraints, and clipboard text cleanly', () => {
+test('cameraDiagnostics formats mode, timestamp, stage timings, saved photo size, takePhoto, torch states, error, constraints, and clipboard text cleanly', () => {
   const info = {
     previewWidth: 1920,
     previewHeight: 1080,
@@ -900,8 +1006,14 @@ test('cameraDiagnostics formats preview, saved photo, takePhoto, torch states, e
     maxPhotoHeight: 3024,
     focusMode: 'continuous',
     exposureMode: 'continuous',
+    lastCaptureMode: 'high-quality' as const,
+    lastCaptureTimestamp: 1700000000000,
+    lastCaptureMs: 240,
+    lastProcessingMs: 85,
+    lastSavingMs: 14,
     lastSavedPhotoWidth: 4032,
     lastSavedPhotoHeight: 3024,
+    lastSavedPhotoBytes: 2 * 1024 * 1024,
     lastSavedPhotoMethod: 'takePhoto' as const,
     torchSupported: true,
     requestedTorch: true,
@@ -912,20 +1024,29 @@ test('cameraDiagnostics formats preview, saved photo, takePhoto, torch states, e
     },
   };
   const rows = buildCameraDiagnosticsRows(info);
-  assert.equal(rows.length, 9);
-  assert.ok(rows[0].value.includes('1920 × 1080'));
-  assert.ok(rows[1].value.includes('4032 × 3024'));
-  assert.ok(rows[2].value.includes('مدعوم'));
-  assert.ok(rows[3].value.includes('continuous'));
-  assert.equal(rows[4].value, 'نعم');
-  assert.ok(rows[5].value.includes('ON'));
-  assert.ok(rows[6].value.includes('OFF'));
-  assert.ok(rows[7].value.includes('OverconstrainedError: busy'));
-  assert.ok(rows[8].value.includes('"torch":true'));
+  assert.equal(rows.length, 12);
+  assert.equal(rows[0].label, 'نمط الالتقاط');
+  assert.equal(rows[0].value, 'جودة عالية');
+  assert.equal(rows[1].label, 'وقت آخر التقاط');
+  assert.notEqual(rows[1].value, 'لم يُلتقط بعد');
+  assert.ok(rows[2].value.includes('التقاط: 240 م.ث'));
+  assert.ok(rows[2].value.includes('معالجة: 85 م.ث'));
+  assert.ok(rows[2].value.includes('حفظ: 14 م.ث'));
+  assert.ok(rows[3].value.includes('4032 × 3024'));
+  assert.ok(rows[3].value.includes('2.00 م.ب'));
+  assert.ok(rows[4].value.includes('1920 × 1080'));
+  assert.ok(rows[5].value.includes('مدعوم'));
+  assert.ok(rows[6].value.includes('continuous'));
+  assert.equal(rows[7].value, 'نعم');
+  assert.ok(rows[8].value.includes('ON'));
+  assert.ok(rows[9].value.includes('OFF'));
+  assert.ok(rows[10].value.includes('OverconstrainedError: busy'));
+  assert.ok(rows[11].value.includes('"torch":true'));
 
   const text = formatCameraDiagnosticsClipboardText(info);
   assert.ok(text.includes('معلومات الكاميرا:'));
   assert.ok(text.includes('4032 × 3024'));
+  assert.ok(text.includes('2.00 م.ب'));
   assert.ok(text.includes('دعم الفلاش'));
   assert.ok(text.includes('OverconstrainedError: busy'));
 });
@@ -1055,14 +1176,14 @@ test('cameraDiagnostics lists candidate cameras with torch/zoom/active marker in
   };
 
   const rows = buildCameraDiagnosticsRows(info);
-  assert.equal(rows.length, 11);
-  assert.equal(rows[9].label, 'كاميرا 1 (المستخدمة)');
-  assert.ok(rows[9].value.includes('camera2 0, facing back'));
-  assert.ok(rows[9].value.includes('فلاش: نعم'));
-  assert.ok(rows[9].value.includes('تقريب: 1–8x'));
-  assert.equal(rows[10].label, 'كاميرا 2');
-  assert.ok(rows[10].value.includes('فلاش: لا'));
-  assert.ok(rows[10].value.includes('NotSupportedError: no torch'));
+  assert.equal(rows.length, 14);
+  assert.equal(rows[12].label, 'كاميرا 1 (المستخدمة)');
+  assert.ok(rows[12].value.includes('camera2 0, facing back'));
+  assert.ok(rows[12].value.includes('فلاش: نعم'));
+  assert.ok(rows[12].value.includes('تقريب: 1–8x'));
+  assert.equal(rows[13].label, 'كاميرا 2');
+  assert.ok(rows[13].value.includes('فلاش: لا'));
+  assert.ok(rows[13].value.includes('NotSupportedError: no torch'));
 
   const clipboard = formatCameraDiagnosticsClipboardText(info);
   assert.ok(clipboard.includes('كاميرا 1 (المستخدمة)'));
@@ -1838,4 +1959,1244 @@ test('musicLogic derives short names cleanly, filters tabs/recent/lists, and pre
   assert.equal(restored[1].missingFile, true);
 });
 
+test('captureQueue enforces max 5 pending queue, 1.2s overlay cap, 4096px/0.92 JPEG settings, and hardware zoom preset selection', () => {
+  assert.equal(MAX_CAPTURE_QUEUE_PENDING, 5);
+  assert.equal(FREEZE_OVERLAY_MAX_MS, 1200);
+  assert.equal(MAX_SAVED_PHOTO_LONG_SIDE, 4096);
+  assert.equal(SAVED_PHOTO_JPEG_QUALITY, 0.92);
+  assert.equal(THUMBNAIL_MAX_LONG_SIDE, 480);
+  assert.equal(THUMBNAIL_JPEG_QUALITY, 0.8);
+  assert.equal(CAMERA_TAKE_PHOTO_TIMEOUT_MS, 2000);
 
+  assert.equal(resolveCaptureMode(undefined), 'fast');
+  assert.equal(resolveCaptureMode('high-quality'), 'high-quality');
+  assert.equal(resolveCaptureMode('fast'), 'fast');
+  assert.equal(formatCaptureModeLabel('high-quality'), 'جودة عالية');
+  assert.equal(formatCaptureModeLabel('fast'), 'سريع');
+
+  // Queue accepts up to 5 pending items, rejects the 6th, and frees slots on completion
+  let queueState = { pendingCount: 0, maxPending: MAX_CAPTURE_QUEUE_PENDING };
+  for (let i = 0; i < 5; i++) {
+    assert.equal(canAcceptCapture(queueState), true);
+    const step = enqueuePendingCapture(queueState);
+    assert.equal(step.accepted, true);
+    queueState = step.next;
+  }
+  assert.equal(queueState.pendingCount, 5);
+  assert.equal(canAcceptCapture(queueState), false);
+  const rejected = enqueuePendingCapture(queueState);
+  assert.equal(rejected.accepted, false);
+  assert.equal(rejected.next.pendingCount, 5);
+
+  queueState = completePendingCapture(queueState);
+  assert.equal(queueState.pendingCount, 4);
+  assert.equal(canAcceptCapture(queueState), true);
+  assert.equal(
+    completePendingCapture({ pendingCount: 0, maxPending: 5 }).pendingCount,
+    0
+  );
+
+  // Freeze-frame overlay max duration helper
+  assert.equal(computeFreezeDismissDelayMs(1000, 1000), 1200);
+  assert.equal(computeFreezeDismissDelayMs(1000, 1500), 700);
+  assert.equal(computeFreezeDismissDelayMs(1000, 2500), 0);
+
+  // Hardware zoom presets are hidden when track lacks zoom, and clamped cleanly when present
+  assert.deepEqual(resolveAvailableZoomPresets(null), []);
+  assert.deepEqual(resolveAvailableZoomPresets({ min: 1, max: 1.2 }), []);
+  assert.deepEqual(resolveAvailableZoomPresets({ min: 1, max: 2.2 }), [1, 2]);
+  assert.deepEqual(resolveAvailableZoomPresets({ min: 1, max: 5 }), [1, 2, 3]);
+  assert.equal(clampHardwareZoom(2.54, { min: 1, max: 4 }), 2.5);
+  assert.equal(clampHardwareZoom(9, { min: 1, max: 4 }), 4);
+  assert.equal(clampHardwareZoom(0.5, null), 1);
+
+  // Backup sanitizer preserves captureMode & thumbnailDataUrl and defaults captureMode to fast
+  const settingsClean = sanitizeSettingsRecord({ captureMode: 'high-quality' });
+  assert.equal(settingsClean.captureMode, 'high-quality');
+  const settingsDefault = sanitizeSettingsRecord({});
+  assert.equal(settingsDefault.captureMode, 'fast');
+  assert.equal(settingsDefault.previewResolution, 'auto');
+  const photoClean = sanitizePhotoRecord({
+    id: 'p_thumb',
+    sessionId: 's1',
+    timestamp: 1000,
+    dateKey: '2026-11-22',
+    dataUrl: 'data:image/jpeg;base64,FULL',
+    thumbnailDataUrl: 'data:image/jpeg;base64,THUMB',
+    width: 4000,
+    height: 3000,
+  });
+  assert.equal(photoClean?.thumbnailDataUrl, 'data:image/jpeg;base64,THUMB');
+});
+
+test('extractAutoTakeQuantityAndUnit parses trailing/attached numbers, separators, and unit words while restricting decimals to kg/gram and protecting weights/7up/calculator lines', () => {
+  // Arabic unit words (spaced & attached)
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('عصير 5 قطع'), {
+    cleanName: 'عصير',
+    quantity: 5,
+    unit: 'piece',
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('عصير5قطع'), {
+    cleanName: 'عصير',
+    quantity: 5,
+    unit: 'piece',
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('مياه 4 قطعة'), {
+    cleanName: 'مياه',
+    quantity: 4,
+    unit: 'piece',
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('شاي 2 كارتون'), {
+    cleanName: 'شاي',
+    quantity: 2,
+    unit: 'carton',
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('بيبسي 3 علبة'), {
+    cleanName: 'بيبسي',
+    quantity: 3,
+    unit: 'box',
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('لحم 1.5 كيلو'), {
+    cleanName: 'لحم',
+    quantity: 1.5,
+    unit: 'kg',
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('لحم1.5كيلو'), {
+    cleanName: 'لحم',
+    quantity: 1.5,
+    unit: 'kg',
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('زعفران 0.5 غرام'), {
+    cleanName: 'زعفران',
+    quantity: 0.5,
+    unit: 'gram',
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('زعفران 500غرام'), {
+    cleanName: 'زعفران',
+    quantity: 500,
+    unit: 'gram',
+  });
+
+  // Attached bare digits & Arabic-Indic digits & trailing separators (x, ×, *, :, =)
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('تفاح2'), {
+    cleanName: 'تفاح',
+    quantity: 2,
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('تفاح 2'), {
+    cleanName: 'تفاح',
+    quantity: 2,
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('تفاح٢'), {
+    cleanName: 'تفاح',
+    quantity: 2,
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('تفاح x2'), {
+    cleanName: 'تفاح',
+    quantity: 2,
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('تفاح ×2'), {
+    cleanName: 'تفاح',
+    quantity: 2,
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('تفاح *2'), {
+    cleanName: 'تفاح',
+    quantity: 2,
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('تفاح:2'), {
+    cleanName: 'تفاح',
+    quantity: 2,
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('تفاح=2'), {
+    cleanName: 'تفاح',
+    quantity: 2,
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('تفاح x 2'), {
+    cleanName: 'تفاح',
+    quantity: 2,
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('cola x3'), {
+    cleanName: 'cola',
+    quantity: 3,
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('box2'), {
+    cleanName: 'box',
+    quantity: 2,
+  });
+
+  // Decimals rejected unless unit is كيلو or غرام
+  assert.equal(extractAutoTakeQuantityAndUnit('تفاح 1.5'), null);
+  assert.equal(extractAutoTakeQuantityAndUnit('تفاح1.5'), null);
+  assert.equal(extractAutoTakeQuantityAndUnit('عصير 2.5 قطع'), null);
+  assert.equal(extractAutoTakeQuantityAndUnit('بيبسي 1.5 علبة'), null);
+  assert.equal(extractAutoTakeQuantityAndUnit('شاي 1.5 كارتون'), null);
+
+  // English unit words
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('coffee 2 carton'), {
+    cleanName: 'coffee',
+    quantity: 2,
+    unit: 'carton',
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('biscuit 3 box'), {
+    cleanName: 'biscuit',
+    quantity: 3,
+    unit: 'box',
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('tea 12 pcs'), {
+    cleanName: 'tea',
+    quantity: 12,
+    unit: 'piece',
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('rice 5 kg'), {
+    cleanName: 'rice',
+    quantity: 5,
+    unit: 'kg',
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('spices 250 g'), {
+    cleanName: 'spices',
+    quantity: 250,
+    unit: 'gram',
+  });
+
+  // Weight stays in name, final number (+ optional unit) is extracted
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('قوطية 200غ 5'), {
+    cleanName: 'قوطية 200غ',
+    quantity: 5,
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('قوطية 200غ 5 علبة'), {
+    cleanName: 'قوطية 200غ',
+    quantity: 5,
+    unit: 'box',
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('200غ حليب 3 كارتون'), {
+    cleanName: '200غ حليب',
+    quantity: 3,
+    unit: 'carton',
+  });
+  assert.deepEqual(extractAutoTakeQuantityAndUnit('7up 6'), {
+    cleanName: '7up',
+    quantity: 6,
+  });
+
+  // Letters/abbreviations after number or numbers before name -> NEVER extracted
+  assert.equal(extractAutoTakeQuantityAndUnit('جبن 200غ'), null);
+  assert.equal(extractAutoTakeQuantityAndUnit('ماء 1.5ل'), null);
+  assert.equal(extractAutoTakeQuantityAndUnit('عصير 350مل'), null);
+  assert.equal(extractAutoTakeQuantityAndUnit('7up'), null);
+  assert.equal(extractAutoTakeQuantityAndUnit('شاي 500غم'), null);
+  assert.equal(extractAutoTakeQuantityAndUnit('200غ حليب'), null);
+  assert.equal(extractAutoTakeQuantityAndUnit('5 حليب'), null);
+  assert.equal(extractAutoTakeQuantityAndUnit('3 كارتون حليب'), null);
+
+  // Calculator lines -> NEVER extracted
+  assert.equal(extractAutoTakeQuantityAndUnit('42'), null);
+  assert.equal(extractAutoTakeQuantityAndUnit('6 * 12'), null);
+  assert.equal(extractAutoTakeQuantityAndUnit('حليب 6 * 12'), null);
+  assert.equal(extractAutoTakeQuantityAndUnit('حليب 6 * 12 قطع'), null);
+});
+
+test('unitMemory stores normalized product units, resolves in priority order, supports fixed mode, and clears cleanly', () => {
+  const store = new Map<string, string>();
+  const mockStorage: SimpleStorageLike = {
+    getItem: (k) => store.get(k) ?? null,
+    setItem: (k, v) => {
+      store.set(k, v);
+    },
+    removeItem: (k) => {
+      store.delete(k);
+    },
+  };
+
+  assert.equal(normalizeProductNameForUnitMemory('  أرز  بَسمتي 2 '), 'ارز بسمتي');
+
+  rememberUnitForProduct('أرز بسمتي', 'kg', mockStorage);
+  rememberUnitForProduct('عصير', 'piece', mockStorage);
+  const loaded = loadProductUnitMemory(mockStorage);
+  assert.equal(loaded['ارز بسمتي'], 'kg');
+  assert.equal(loaded['عصير'], 'piece');
+
+  // Resolution order: (1) explicit -> (2) remembered (in per-product mode) -> (3) default -> undefined
+  assert.equal(
+    resolveQuantityUnit({
+      explicitUnit: 'box',
+      productName: 'أرز بسمتي',
+      unitMode: 'per-product',
+      defaultUnit: 'carton',
+      memory: loaded,
+    }),
+    'box'
+  );
+  assert.equal(
+    resolveQuantityUnit({
+      productName: 'ارز بسمتي',
+      unitMode: 'per-product',
+      defaultUnit: 'carton',
+      memory: loaded,
+    }),
+    'kg'
+  );
+  assert.equal(
+    resolveQuantityUnit({
+      productName: 'سكر',
+      unitMode: 'per-product',
+      defaultUnit: 'carton',
+      memory: loaded,
+    }),
+    'carton'
+  );
+  assert.equal(
+    resolveQuantityUnit({
+      productName: 'سكر',
+      unitMode: 'per-product',
+      defaultUnit: 'none',
+      memory: loaded,
+    }),
+    undefined
+  );
+
+  // Fixed mode skips per-product memory and falls back directly to default unit
+  assert.equal(
+    resolveQuantityUnit({
+      productName: 'ارز بسمتي',
+      unitMode: 'fixed',
+      defaultUnit: 'box',
+      memory: loaded,
+    }),
+    'box'
+  );
+
+  forgetUnitForProduct('عصير', mockStorage);
+  assert.equal(loadProductUnitMemory(mockStorage)['عصير'], undefined);
+
+  clearProductUnitMemory(mockStorage);
+  assert.deepEqual(loadProductUnitMemory(mockStorage), {});
+});
+
+test('all 5 quantity units format cleanly, copy/WhatsApp honor them, duplicate merge guards differing units, and backupSanitizer handles new settings', () => {
+  assert.equal(formatQuantityUnitLabel('carton'), 'كارتون');
+  assert.equal(formatQuantityUnitLabel('box'), 'علبة');
+  assert.equal(formatQuantityUnitLabel('piece'), 'قطع');
+  assert.equal(formatQuantityUnitLabel('kg'), 'كيلو');
+  assert.equal(formatQuantityUnitLabel('gram'), 'غرام');
+  assert.equal(formatQuantityUnitLabel(undefined), '');
+
+  const copied = formatNoteForCopy({
+    title: 'طلب',
+    body: 'زعفران\nبيبسي\nسكر',
+    numberingEnabled: false,
+    quantitiesEnabled: true,
+    lineQuantities: [
+      { lineIndex: 0, quantity: 500, unit: 'gram' },
+      { lineIndex: 1, quantity: 3, unit: 'box' },
+      { lineIndex: 2, quantity: 2, unit: 'kg' },
+    ],
+  });
+  assert.ok(copied.includes('500\u200E غرام'));
+  assert.ok(copied.includes('3\u200E علبة'));
+  assert.ok(copied.includes('2\u200E كيلو'));
+
+  const wa = formatNoteForWhatsApp({
+    title: 'طلب',
+    body: 'عصير',
+    quantitiesEnabled: true,
+    lineQuantities: [{ lineIndex: 0, quantity: 5, unit: 'piece' }],
+  });
+  assert.ok(wa.includes('5\u200E قطع'));
+
+  // Differing explicit units block duplicate merge and preserve lines untouched
+  const blocked = mergeDuplicateLines({
+    body: 'عصير\nخبز\nعصير',
+    linePhotos: [],
+    lineQuantities: [
+      { lineIndex: 0, quantity: 2, unit: 'carton' },
+      { lineIndex: 2, quantity: 5, unit: 'piece' },
+    ],
+    keepIndex: 0,
+    removeIndices: [2],
+  });
+  assert.equal(blocked.unitMismatch, true);
+  assert.equal(blocked.mergedQuantity, null);
+  assert.equal(blocked.body, 'عصير\nخبز\nعصير');
+  assert.equal(blocked.lineQuantities.length, 2);
+
+  // Matching units merge normally
+  const mergedSame = mergeDuplicateLines({
+    body: 'عصير\nعصير',
+    linePhotos: [],
+    lineQuantities: [
+      { lineIndex: 0, quantity: 2, unit: 'box' },
+      { lineIndex: 1, quantity: 4, unit: 'box' },
+    ],
+    keepIndex: 0,
+    removeIndices: [1],
+  });
+  assert.equal(mergedSame.unitMismatch, false);
+  assert.equal(mergedSame.mergedQuantity, 6);
+  assert.deepEqual(mergedSame.lineQuantities, [
+    { lineIndex: 0, quantity: 6, unit: 'box' },
+  ]);
+
+  // backupSanitizer defaults & validation for autoTakeNoteNumber, noteUnitMode, noteDefaultUnit
+  const defaults = sanitizeSettingsRecord({});
+  assert.equal(defaults.autoTakeNoteNumber, false);
+  assert.equal(defaults.noteUnitMode, 'per-product');
+  assert.equal(defaults.noteDefaultUnit, 'none');
+
+  const custom = sanitizeSettingsRecord({
+    autoTakeNoteNumber: true,
+    noteUnitMode: 'fixed',
+    noteDefaultUnit: 'gram',
+  });
+  assert.equal(custom.autoTakeNoteNumber, true);
+  assert.equal(custom.noteUnitMode, 'fixed');
+  assert.equal(custom.noteDefaultUnit, 'gram');
+});
+
+test('computeStorageBreakdown computes separate photos, notes, and audio sizes accurately', () => {
+  const b64Payload = 'A'.repeat(400); // ~300 decoded bytes
+  const breakdown = computeStorageBreakdown({
+    photos: [
+      {
+        id: 'p1',
+        sessionId: 's1',
+        timestamp: 1000,
+        dateKey: '2026-11-24',
+        dataUrl: `data:image/jpeg;base64,${b64Payload}`,
+        thumbnailDataUrl: `data:image/jpeg;base64,${'B'.repeat(100)}`,
+        width: 800,
+        height: 600,
+      },
+    ],
+    notes: [
+      {
+        id: 'n1',
+        title: 'نواقص',
+        body: 'حليب\nخبز',
+        photos: [],
+        linePhotos: [
+          { lineIndex: 0, dataUrl: `data:image/jpeg;base64,${'C'.repeat(200)}` },
+        ],
+        numberingEnabled: true,
+        resetAfterBlankLine: false,
+        createdAt: 1000,
+        updatedAt: 1000,
+      },
+    ],
+    audioBytes: 12000,
+  });
+
+  assert.equal(breakdown.photosBytes, 300 + 75 + 256);
+  assert.equal(breakdown.notesBytes, 5 * 2 + 8 * 2 + 256 + 150);
+  assert.equal(breakdown.audioBytes, 12000);
+  assert.equal(
+    breakdown.totalBytes,
+    breakdown.photosBytes + breakdown.notesBytes + breakdown.audioBytes
+  );
+
+  // Deprecated duplicateDebugEnabled toggle is stripped cleanly by sanitizeSettingsRecord
+  const sanitized = sanitizeSettingsRecord({
+    duplicateDebugEnabled: true,
+    cameraHighQuality: false,
+  } as Record<string, unknown>);
+  assert.equal('duplicateDebugEnabled' in sanitized, false);
+  assert.equal(sanitized.cameraHighQuality, false);
+});
+
+test('photoEnhancement: defaults, auto exposure gamma lift, highlight safety, and bright-scene no-op', () => {
+  assert.equal(ENHANCE_TIMEOUT_MS, 8000);
+  assert.equal(resolveEnhanceLevel(undefined), 'medium');
+  assert.equal(resolveEnhanceLevel('off'), null);
+  assert.equal(resolveEnhanceLevel('light'), 'light');
+  assert.equal(resolveEnhanceLevel('strong'), 'strong');
+  assert.equal(formatEnhanceLevelLabel('medium'), 'متوسط');
+
+  // Dark scene (mean ~45) gets gamma in [0.6, 1.0) scaled by strength, and bright pixels do not clip > 255
+  const darkAcc = createEmptyAnalyzeAccumulator();
+  const darkW = 16;
+  const darkH = 16;
+  const darkBuf = new Uint8ClampedArray(darkW * darkH * 4);
+  for (let i = 0; i < darkBuf.length; i += 4) {
+    const pxIdx = i / 4;
+    if (pxIdx < 4) {
+      // Pure highlight pixels that must never clip past 255 or crush downward
+      darkBuf[i] = 252;
+      darkBuf[i + 1] = 252;
+      darkBuf[i + 2] = 250;
+    } else {
+      darkBuf[i] = 42;
+      darkBuf[i + 1] = 44;
+      darkBuf[i + 2] = 40;
+    }
+    darkBuf[i + 3] = 255;
+  }
+  accumulateTileStats(darkAcc, darkBuf);
+  const darkStats = finalizeImageStats(darkAcc);
+  assert.ok(darkStats.meanLuminance < 80);
+
+  const planLight = computeEnhancementPlan(darkStats, 'light');
+  const planMed = computeEnhancementPlan(darkStats, 'medium');
+  const planStrong = computeEnhancementPlan(darkStats, 'strong');
+  assert.ok(planLight.gamma < 1.0 && planLight.gamma >= 0.6);
+  assert.ok(planMed.gamma < planLight.gamma && planMed.gamma >= 0.6);
+  assert.ok(planStrong.gamma <= planMed.gamma && planStrong.gamma >= 0.6);
+  assert.equal(planMed.applyDenoise, true);
+
+  const copyForRun = new Uint8ClampedArray(darkBuf);
+  const res = enhanceRgbaBuffer(copyForRun, darkW, darkH, 'medium');
+  assert.ok(res.afterLuminance > res.beforeLuminance + 8);
+  assert.ok(copyForRun[0] >= 245 && copyForRun[0] <= 255);
+
+  // Bright scene (mean >= 110) leaves gamma at 1.0 and skips dark noise reduction
+  const brightAcc = createEmptyAnalyzeAccumulator();
+  const brightBuf = new Uint8ClampedArray(8 * 8 * 4);
+  for (let i = 0; i < brightBuf.length; i += 4) {
+    brightBuf[i] = 160;
+    brightBuf[i + 1] = 158;
+    brightBuf[i + 2] = 155;
+    brightBuf[i + 3] = 255;
+  }
+  accumulateTileStats(brightAcc, brightBuf);
+  const brightPlan = computeEnhancementPlan(finalizeImageStats(brightAcc), 'strong');
+  assert.equal(brightPlan.gamma, 1.0);
+  assert.equal(brightPlan.applyDenoise, false);
+});
+
+test('photoEnhancement: white balance clamps strictly and skips single-color dominated scenes; contrast keeps color ratios', () => {
+  // Moderate warm indoor cast -> WB runs and stays clamped within [0.95, 1.05] for light, [0.9, 1.1] for medium/strong
+  const warmAcc = createEmptyAnalyzeAccumulator();
+  const warmBuf = new Uint8ClampedArray(10 * 10 * 4);
+  for (let i = 0; i < warmBuf.length; i += 4) {
+    const shade = (i / 4) % 2 === 0 ? 110 : 145;
+    warmBuf[i] = shade + 14;
+    warmBuf[i + 1] = shade;
+    warmBuf[i + 2] = shade - 14;
+    warmBuf[i + 3] = 255;
+  }
+  accumulateTileStats(warmAcc, warmBuf);
+  const warmStats = finalizeImageStats(warmAcc);
+  assert.equal(warmStats.isSingleColorDominated, false);
+
+  const wbLight = computeEnhancementPlan(warmStats, 'light');
+  assert.equal(wbLight.wbSkipped, false);
+  assert.ok(wbLight.rGain >= 0.95 && wbLight.rGain <= 1.05);
+  assert.ok(wbLight.bGain >= 0.95 && wbLight.bGain <= 1.05);
+
+  const wbStrong = computeEnhancementPlan(warmStats, 'strong');
+  assert.equal(wbStrong.wbSkipped, false);
+  assert.ok(wbStrong.rGain >= 0.9 && wbStrong.rGain <= 1.1);
+  assert.ok(wbStrong.bGain >= 0.9 && wbStrong.bGain <= 1.1);
+  assert.ok(wbStrong.bGain > wbStrong.rGain);
+
+  // Single dominant red product scene -> WB is skipped
+  const redAcc = createEmptyAnalyzeAccumulator();
+  const redBuf = new Uint8ClampedArray(10 * 10 * 4);
+  for (let i = 0; i < redBuf.length; i += 4) {
+    redBuf[i] = 200;
+    redBuf[i + 1] = 45;
+    redBuf[i + 2] = 40;
+    redBuf[i + 3] = 255;
+  }
+  accumulateTileStats(redAcc, redBuf);
+  const redStats = finalizeImageStats(redAcc);
+  assert.equal(redStats.isSingleColorDominated, true);
+  const redPlan = computeEnhancementPlan(redStats, 'strong');
+  assert.equal(redPlan.wbSkipped, true);
+  assert.equal(redPlan.rGain, 1);
+  assert.equal(redPlan.gGain, 1);
+  assert.equal(redPlan.bGain, 1);
+
+  // Contrast step applies identical RGB gain (with wbSkipped & zero saturation boost isolated)
+  const testToneBuf = new Uint8ClampedArray([
+    80, 100, 120, 255,
+    160, 180, 200, 255,
+  ]);
+  const isolatedPlan = {
+    ...wbStrong,
+    gamma: 1,
+    rGain: 1,
+    gGain: 1,
+    bGain: 1,
+    satBoost: 0,
+    contrastLow: 85,
+    contrastHigh: 190,
+    contrastScaleStrength: 0.7,
+  };
+  applyToneAndColorInPlace(testToneBuf, isolatedPlan);
+  // Check ratio R:G:B of first pixel stays ~0.80 : 1.00 : 1.20
+  const rRatio = testToneBuf[0] / testToneBuf[1];
+  const bRatio = testToneBuf[2] / testToneBuf[1];
+  assert.ok(Math.abs(rRatio - 0.8) < 0.04);
+  assert.ok(Math.abs(bRatio - 1.2) < 0.04);
+});
+
+test('photoEnhancement settings defaults, originalDataUrl storage accounting, auto-cleanup, and diagnostics rows', () => {
+  const defaultSettings = sanitizeSettingsRecord({});
+  assert.equal(defaultSettings.photoEnhanceLevel, 'medium');
+  assert.equal(defaultSettings.enhanceGalleryImports, false);
+  assert.equal(defaultSettings.keepOriginalPhoto, false);
+
+  const customSettings = sanitizeSettingsRecord({
+    photoEnhanceLevel: 'strong',
+    enhanceGalleryImports: true,
+    keepOriginalPhoto: true,
+  });
+  assert.equal(customSettings.photoEnhanceLevel, 'strong');
+  assert.equal(customSettings.enhanceGalleryImports, true);
+  assert.equal(customSettings.keepOriginalPhoto, true);
+
+  const cleanPhoto = sanitizePhotoRecord({
+    id: 'ph_1',
+    sessionId: 's_1',
+    timestamp: 1000,
+    dateKey: '2026-11-24',
+    dataUrl: 'data:image/jpeg;base64,AAAA',
+    originalDataUrl: 'data:image/jpeg;base64,BBBB',
+    width: 100,
+    height: 100,
+    enhancementStatus: 'enhanced',
+    enhancementLevel: 'medium',
+  });
+  assert.equal(cleanPhoto?.originalDataUrl, 'data:image/jpeg;base64,BBBB');
+  assert.equal(cleanPhoto?.enhancementStatus, 'enhanced');
+  assert.equal(cleanPhoto?.enhancementLevel, 'medium');
+
+  const storage = computeStorageBreakdown({
+    photos: [
+      {
+        id: 'p1',
+        sessionId: 's1',
+        timestamp: 1000,
+        dateKey: '2026-11-24',
+        dataUrl: `data:image/jpeg;base64,${'A'.repeat(400)}`,
+        originalDataUrl: `data:image/jpeg;base64,${'B'.repeat(400)}`,
+        width: 800,
+        height: 600,
+      },
+    ],
+    notes: [],
+    audioBytes: 0,
+  });
+  assert.equal(storage.photosBytes, 300 + 300 + 256);
+
+  const diagRows = buildCameraDiagnosticsRows({
+    lastEnhanceMs: 142,
+    lastEnhanceBeforeLuminance: 68.4,
+    lastEnhanceAfterLuminance: 109.2,
+    lastEnhanceLevel: 'medium',
+  });
+  assert.ok(
+    diagRows.some(
+      (r) =>
+        r.label === 'تحسين الصور الأخير' && r.value.includes('متوسط') && r.value.includes('142 م.ث')
+    )
+  );
+  assert.ok(
+    diagRows.some(
+      (r) => r.label === 'متوسط السطوع (قبل ← بعد)' && r.value === '68 → 109'
+    )
+  );
+});
+
+test('cameraPerf monitors adaptive FPS downgrade (>=3s below 20fps, never while capturing), summarizes 10s metrics & longtasks, and enforces 2Hz auto-flash cadence', () => {
+  assert.equal(AUTO_FLASH_DEFAULTS.sampleIntervalMs, 500);
+  assert.equal(ADAPTIVE_FPS_LOW_THRESHOLD, 20);
+  assert.equal(ADAPTIVE_FPS_SUSTAIN_MS, 3000);
+  assert.equal(PERF_TEST_DURATION_MS, 10000);
+
+  // Preview resolution defaults and ladder target dimensions
+  assert.equal(resolvePreviewResolutionSetting(undefined, undefined), 'auto');
+  assert.equal(resolvePreviewResolutionSetting(undefined, false), '720p');
+  assert.equal(resolvePreviewResolutionSetting('1080p', false), '1080p');
+  assert.deepEqual(getTargetPreviewDims('auto'), {
+    width: 1920,
+    height: 1080,
+    frameRate: 30,
+  });
+  assert.deepEqual(getTargetPreviewDims('720p'), {
+    width: 1280,
+    height: 720,
+    frameRate: 30,
+  });
+
+  // Adaptive preview: resets timer if capturing or if FPS recovers above 20, triggers after 3s continuous <20fps
+  let apState = createAdaptivePreviewState();
+  let step = stepAdaptivePreviewState(apState, {
+    mode: 'auto',
+    currentFps: 15,
+    nowMs: 1000,
+    isCapturing: false,
+  });
+  apState = step.nextState;
+  assert.equal(step.shouldDowngrade, false);
+
+  // Interruption while capturing resets low-FPS window
+  step = stepAdaptivePreviewState(apState, {
+    mode: 'auto',
+    currentFps: 12,
+    nowMs: 3900,
+    isCapturing: true,
+  });
+  apState = step.nextState;
+  assert.equal(step.shouldDowngrade, false);
+  assert.equal(apState.lowFpsSinceMs, null);
+
+  // Restart low FPS window -> stays false at +2500ms, triggers at +3100ms
+  step = stepAdaptivePreviewState(apState, {
+    mode: 'auto',
+    currentFps: 17,
+    nowMs: 5000,
+    isCapturing: false,
+  });
+  apState = step.nextState;
+  step = stepAdaptivePreviewState(apState, {
+    mode: 'auto',
+    currentFps: 18,
+    nowMs: 7500,
+    isCapturing: false,
+  });
+  apState = step.nextState;
+  assert.equal(step.shouldDowngrade, false);
+
+  step = stepAdaptivePreviewState(apState, {
+    mode: 'auto',
+    currentFps: 16,
+    nowMs: 8100,
+    isCapturing: false,
+  });
+  apState = step.nextState;
+  assert.equal(step.shouldDowngrade, true);
+  assert.equal(apState.downgraded, true);
+
+  // Fixed '1080p' setting must never downgrade
+  const fixedResStep = stepAdaptivePreviewState(createAdaptivePreviewState(), {
+    mode: '1080p',
+    currentFps: 10,
+    nowMs: 9000,
+    isCapturing: false,
+  });
+  assert.equal(fixedResStep.shouldDowngrade, false);
+
+  // Frame stats and longtasks report formatting
+  const frameStats = computeVideoFrameStats([0, 33, 66, 200, 233]);
+  assert.equal(frameStats.frameCount, 5);
+  assert.equal(frameStats.longestGapMs, 134);
+  assert.equal(frameStats.gapsOver100Ms, 1);
+  assert.ok(frameStats.avgFps > 16 && frameStats.avgFps < 18);
+
+  const longTasks = summarizeLongTasks([18, 52, 85.4, 30, 61]);
+  assert.equal(longTasks.countOver50Ms, 3);
+  assert.equal(longTasks.longestMs, 85.4);
+
+  const report = buildCameraPerfReport({
+    frameTimestampsMs: [0, 33.3, 66.6, 100],
+    longTaskDurationsMs: [72],
+    longTasksSupported: true,
+    requestedWidth: 1920,
+    requestedHeight: 1080,
+    requestedFps: 30,
+    actualWidth: 1920,
+    actualHeight: 1080,
+    captureMode: 'fast',
+    diagnostics: {
+      lastCaptureMs: 12,
+      lastProcessingMs: 44,
+      lastSavingMs: 8,
+      lastEnhanceMs: 95,
+      lastEnhanceLevel: 'medium',
+    },
+    durationMs: 10000,
+  });
+  const text = formatPerfReportText(report);
+  assert.ok(text.includes('1920×1080 @ 30fps'));
+  assert.ok(text.includes('سريع'));
+  assert.ok(text.includes('95 م.ث'));
+  assert.ok(text.includes('1 مهمة'));
+});
+
+test('backgroundCameraQueue serializes workers one-at-a-time, pauses 1.5s after shutter while camera is open, resumes immediately on leaving Capture tab, and batches photo writes', async () => {
+  let fakeClock = 10000;
+  const flushedBatches: number[] = [];
+
+  __configureBackgroundQueueForTest({
+    now: () => fakeClock,
+    batchWriter: async (batch) => {
+      flushedBatches.push(batch.length);
+    },
+    reset: true,
+  });
+
+  // 1) 1.5s shutter pause while Capture tab is active, immediate resume upon leaving
+  setCaptureTabActive(true);
+  notifyShutterPressed(10000);
+  assert.equal(getRemainingShutterPauseMs(10500), 1000);
+  assert.equal(getRemainingShutterPauseMs(11500), 0);
+  assert.equal(SHUTTER_BACKGROUND_PAUSE_MS, 1500);
+
+  let resumed = false;
+  const waitPromise = waitForBackgroundSlot({ requireIdle: true }).then(() => {
+    resumed = true;
+  });
+  assert.equal(resumed, false);
+  // Leaving Capture tab cancels remaining pause immediately
+  setCaptureTabActive(false);
+  await waitPromise;
+  assert.equal(resumed, true);
+
+  // 2) Single-worker mutex prevents concurrent worker tasks
+  let activeCount = 0;
+  let maxConcurrent = 0;
+  const makeWorkerTask = (delayMs: number) =>
+    runExclusiveWorkerTask(async () => {
+      activeCount++;
+      maxConcurrent = Math.max(maxConcurrent, activeCount);
+      await new Promise((r) => setTimeout(r, delayMs));
+      activeCount--;
+    });
+  await Promise.all([makeWorkerTask(15), makeWorkerTask(15), makeWorkerTask(10)]);
+  assert.equal(maxConcurrent, 1);
+
+  // 3) Batched photo writes group small batches cleanly instead of single-shot saves inside shutter
+  const samplePhoto = (id: string) => ({
+    id,
+    sessionId: 's_test',
+    timestamp: 1000,
+    dateKey: '2026-11-24',
+    dataUrl: 'data:image/jpeg;base64,AA',
+    width: 100,
+    height: 100,
+  });
+  const p1 = enqueueBatchedPhotoWrite(samplePhoto('b1'));
+  const p2 = enqueueBatchedPhotoWrite(samplePhoto('b2'));
+  const p3 = enqueueBatchedPhotoWrite(samplePhoto('b3'));
+  await flushPendingPhotoWritesNow();
+  await Promise.all([p1, p2, p3]);
+  assert.equal(flushedBatches.reduce((a, b) => a + b, 0), 3);
+
+  __configureBackgroundQueueForTest({ reset: true });
+});
+
+test('batterySaver evaluates auto/always/off rules, overrides FPS/idle cleanly, tracks session time without polling, and formats measurement rows', () => {
+  assert.equal(resolveCameraIdleTimeoutSec(undefined), 60);
+  assert.equal(resolveCameraIdleTimeoutSec(30), 30);
+  assert.equal(resolveCameraIdleTimeoutSec(120), 120);
+  assert.equal(resolveCameraIdleTimeoutSec(0), 0);
+  assert.equal(resolvePreviewFrameRateSetting(undefined), 24);
+  assert.equal(resolvePreviewFrameRateSetting(15), 15);
+  assert.equal(resolvePreviewFrameRateSetting(30), 30);
+  assert.equal(resolveBatterySaverMode(undefined), 'auto');
+  assert.equal(resolveBatterySaverMode('always'), 'always');
+
+  // Auto threshold <=20% and not charging
+  assert.equal(
+    evaluateBatterySaverActive({
+      mode: 'auto',
+      batterySupported: true,
+      level: 0.2,
+      charging: false,
+    }),
+    true
+  );
+  assert.equal(
+    evaluateBatterySaverActive({
+      mode: 'auto',
+      batterySupported: true,
+      level: 0.15,
+      charging: true,
+    }),
+    false
+  );
+  assert.equal(
+    evaluateBatterySaverActive({
+      mode: 'auto',
+      batterySupported: true,
+      level: 0.25,
+      charging: false,
+    }),
+    false
+  );
+  assert.equal(
+    evaluateBatterySaverActive({
+      mode: 'auto',
+      batterySupported: false,
+      level: null,
+      charging: null,
+    }),
+    false
+  );
+  assert.equal(
+    evaluateBatterySaverActive({
+      mode: 'always',
+      batterySupported: false,
+      level: null,
+      charging: null,
+    }),
+    true
+  );
+  assert.equal(
+    evaluateBatterySaverActive({
+      mode: 'off',
+      batterySupported: true,
+      level: 0.05,
+      charging: false,
+    }),
+    false
+  );
+
+  // Forced 15fps & 30s idle when Battery Saver ON
+  const normalProfile = getEffectiveCameraPowerProfile({
+    settings: {
+      cameraIdleTimeoutSec: 120,
+      previewFrameRate: 24,
+      batterySaverMode: 'auto',
+    },
+    isBatterySaverOn: false,
+  });
+  assert.deepEqual(normalProfile, { frameRate: 24, idleTimeoutSec: 120 });
+
+  const saverProfile = getEffectiveCameraPowerProfile({
+    settings: {
+      cameraIdleTimeoutSec: 0,
+      previewFrameRate: 30,
+      batterySaverMode: 'always',
+    },
+    isBatterySaverOn: true,
+  });
+  assert.deepEqual(saverProfile, { frameRate: 15, idleTimeoutSec: 30 });
+
+  // Session timestamp tracker without polling timers
+  __resetSessionPowerTrackerForTest();
+  markCameraSessionStarted(1000);
+  assert.equal(getSessionCameraActiveMs(6000), 5000);
+  markCameraSessionStopped(11000);
+  markCameraSessionStarted(20000);
+  assert.equal(getSessionCameraActiveMs(25000), 15000);
+  incrementSessionCaptureCount();
+  incrementSessionCaptureCount();
+  assert.equal(getSessionCaptureCount(), 2);
+  assert.equal(formatSessionDurationArabic(75000), '1 د 15 ث');
+
+  const rows = buildBatteryMeasurementRows({
+    cameraActiveMs: 75000,
+    sessionCaptures: 2,
+    batterySupported: true,
+    initialBatteryLevel: 0.84,
+    currentBatteryLevel: 0.19,
+    batteryCharging: false,
+    batterySaverOn: true,
+    batterySaverMode: 'auto',
+  });
+  assert.ok(rows.some((r) => r.value === '1 د 15 ث'));
+  assert.ok(rows.some((r) => r.value === '84%'));
+  assert.ok(rows.some((r) => r.value === '19%'));
+  const clip = formatBatteryMeasurementClipboardText({
+    cameraActiveMs: 75000,
+    sessionCaptures: 2,
+    batterySupported: false,
+    initialBatteryLevel: null,
+    currentBatteryLevel: null,
+    batteryCharging: null,
+    batterySaverOn: false,
+    batterySaverMode: 'auto',
+  });
+  assert.ok(clip.includes('غير مدعوم في هذا المتصفح'));
+  __resetSessionPowerTrackerForTest();
+});
+
+test('cameraStartup preserves preview resolution across 15/24/30fps, adaptive preview does not falsely downgrade 15fps mode, and backupSanitizer validates power fields', () => {
+  const attempts15 = buildCameraConstraintAttempts(true, 'auto', 15);
+  const firstVideo = attempts15[0].video as MediaTrackConstraints;
+  assert.deepEqual(firstVideo.width, { ideal: 1920 });
+  assert.deepEqual(firstVideo.height, { ideal: 1080 });
+  assert.deepEqual(firstVideo.frameRate, { ideal: 15, max: 15 });
+  assert.deepEqual(getTargetPreviewDims('1080p', 15), {
+    width: 1920,
+    height: 1080,
+    frameRate: 15,
+  });
+
+  // Steady 15fps when targetFps is 15 must NOT trigger 720p downgrade
+  let st = createAdaptivePreviewState();
+  for (let t = 0; t <= 4000; t += 1000) {
+    const step = stepAdaptivePreviewState(st, {
+      mode: 'auto',
+      targetFps: 15,
+      currentFps: 14,
+      nowMs: t,
+      isCapturing: false,
+    });
+    st = step.nextState;
+    assert.equal(step.shouldDowngrade, false);
+  }
+
+  const sanitized = sanitizeSettingsRecord({
+    previewFrameRate: 15,
+    cameraIdleTimeoutSec: 120,
+    batterySaverMode: 'always',
+  });
+  assert.equal(sanitized.previewFrameRate, 15);
+  assert.equal(sanitized.cameraIdleTimeoutSec, 120);
+  assert.equal(sanitized.batterySaverMode, 'always');
+
+  const fallbackSanitized = sanitizeSettingsRecord({
+    previewFrameRate: 99,
+    cameraIdleTimeoutSec: 999,
+    batterySaverMode: 'bad',
+  });
+  assert.equal(fallbackSanitized.previewFrameRate, 24);
+  assert.equal(fallbackSanitized.cameraIdleTimeoutSec, 60);
+  assert.equal(fallbackSanitized.batterySaverMode, 'auto');
+});
+
+test('waitForEnhancementSlot enforces 10s idle on Capture tab, pauses under Battery Saver until leaving Capture, and pauses while page is hidden', async () => {
+  let fakeClock = 50000;
+  __configureBackgroundQueueForTest({
+    now: () => fakeClock,
+    reset: true,
+  });
+
+  assert.equal(ENHANCEMENT_IDLE_PAUSE_MS, 10000);
+  setCaptureTabActive(true);
+  notifyCameraActivity(50000);
+  assert.equal(getRemainingEnhancementIdleMs(53000), 7000);
+  assert.equal(getRemainingEnhancementIdleMs(60000), 0);
+
+  // Battery Saver ON + Capture tab active pauses enhancement slot indefinitely until leaving Capture tab
+  setBatterySaverActive(true);
+  assert.equal(isBatterySaverQueuePaused(), true);
+  let slotReady = false;
+  const p = waitForEnhancementSlot().then(() => {
+    slotReady = true;
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(slotReady, false);
+
+  // Page hidden also stays paused even off Capture tab
+  setPageHidden(true);
+  setCaptureTabActive(false);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(slotReady, false);
+
+  // Restoring visibility off Capture tab unblocks immediately
+  setPageHidden(false);
+  await p;
+  assert.equal(slotReady, true);
+
+  __configureBackgroundQueueForTest({ reset: true });
+});
+
+test('pwaDiagnostics validates manifest, registration origin guard, iframe/top-level rows, and clipboard formatting', () => {
+  // Origin guard: only HTTPS or localhost
+  assert.equal(shouldRegisterServiceWorker('https:', 'example.com'), true);
+  assert.equal(shouldRegisterServiceWorker('http:', 'localhost'), true);
+  assert.equal(shouldRegisterServiceWorker('http:', '127.0.0.1'), true);
+  assert.equal(shouldRegisterServiceWorker('http:', '[::1]'), true);
+  assert.equal(shouldRegisterServiceWorker('http:', '192.168.1.50'), false);
+  assert.equal(shouldRegisterServiceWorker('file:', ''), false);
+
+  // Real manifest.webmanifest + icons + index.html + sw.js contracts
+  const rootDir = process.cwd();
+  const manifestPath = path.join(rootDir, 'public', 'manifest.webmanifest');
+  const manifestRaw = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  assert.equal(manifestRaw.name, 'نقص الرفوف');
+  assert.equal(manifestRaw.short_name, 'نقص الرفوف');
+  assert.equal(manifestRaw.lang, 'ar');
+  assert.equal(manifestRaw.dir, 'rtl');
+  assert.equal(manifestRaw.start_url, '/');
+  assert.equal(manifestRaw.scope, '/');
+  assert.equal(manifestRaw.display, 'standalone');
+  assert.equal(manifestRaw.orientation, 'portrait');
+  assert.equal(manifestRaw.background_color, '#0F172A');
+  assert.equal(manifestRaw.theme_color, '#0F172A');
+
+  const manifestValidation = validateManifestPayload(manifestRaw);
+  assert.equal(manifestValidation.valid, true);
+  assert.equal(manifestValidation.icon192Src, '/pwa-192x192.png');
+  assert.equal(manifestValidation.icon512Src, '/pwa-512x512.png');
+
+  // Verify maskable 512x512 icon exists in manifest & PNG IHDR sizes match
+  assert.ok(
+    manifestRaw.icons.some(
+      (i: { sizes?: string; purpose?: string; type?: string }) =>
+        i.sizes === '512x512' && i.purpose === 'maskable' && i.type === 'image/png'
+    )
+  );
+  const readPngDims = (rel: string) => {
+    const buf = fs.readFileSync(path.join(rootDir, 'public', rel));
+    assert.equal(buf.toString('ascii', 1, 4), 'PNG');
+    return {
+      width: buf.readUInt32BE(16),
+      height: buf.readUInt32BE(20),
+    };
+  };
+  assert.deepEqual(readPngDims('pwa-192x192.png'), { width: 192, height: 192 });
+  assert.deepEqual(readPngDims('pwa-512x512.png'), { width: 512, height: 512 });
+  assert.deepEqual(readPngDims('pwa-maskable-512x512.png'), { width: 512, height: 512 });
+
+  // Verify index.html & sw.js contracts
+  const html = fs.readFileSync(path.join(rootDir, 'index.html'), 'utf8');
+  assert.ok(html.includes('<link rel="manifest" href="/manifest.webmanifest"'));
+  assert.ok(html.includes('<link rel="apple-touch-icon"'));
+  assert.ok(html.includes('<meta name="theme-color"'));
+
+  const swSource = fs.readFileSync(path.join(rootDir, 'public', 'sw.js'), 'utf8');
+  assert.ok(swSource.includes("addEventListener('fetch'"));
+  assert.ok(swSource.includes('caches.delete'));
+  assert.ok(swSource.includes('handleNetworkFirst'));
+  assert.ok(swSource.includes('handleCacheFirst'));
+
+  // Invalid manifest rejections
+  assert.equal(validateManifestPayload(null).valid, false);
+  assert.equal(
+    validateManifestPayload({ ...manifestRaw, display: 'browser' }).valid,
+    false
+  );
+  assert.equal(
+    validateManifestPayload({
+      ...manifestRaw,
+      icons: [{ src: '/pwa-192x192.png', sizes: '192x192', type: 'image/png' }],
+    }).valid,
+    false
+  );
+
+  // Diagnostics rows & clipboard formatting for iframe vs top-level
+  const iframeRows = buildPwaDiagnosticsRows({
+    manifestValid: true,
+    iconsLoaded: true,
+    swRegisteredAndActive: false,
+    swDetails: 'غير مسجّل',
+    isHttps: true,
+    protocol: 'https:',
+    isInIframe: true,
+    isStandalone: false,
+    lastError: 'SecurityError: preview frame',
+  });
+  assert.equal(iframeRows.find((r) => r.key === 'manifest')?.value, 'نعم');
+  assert.equal(iframeRows.find((r) => r.key === 'icons')?.value, 'نعم');
+  assert.ok(iframeRows.find((r) => r.key === 'sw')?.value.startsWith('لا'));
+  assert.equal(iframeRows.find((r) => r.key === 'https')?.value, 'نعم');
+  assert.equal(
+    iframeRows.find((r) => r.key === 'iframe')?.value,
+    'نعم (إطار معاينة)'
+  );
+  assert.equal(
+    iframeRows.find((r) => r.key === 'lastError')?.value,
+    'SecurityError: preview frame'
+  );
+
+  const iframeClip = formatPwaDiagnosticsClipboardText({
+    manifestValid: true,
+    iconsLoaded: true,
+    swRegisteredAndActive: true,
+    isHttps: true,
+    protocol: 'https:',
+    isInIframe: true,
+    isStandalone: false,
+    lastError: null,
+  });
+  assert.ok(iframeClip.includes(IFRAME_INSTALL_WARNING_TEXT));
+  assert.ok(iframeClip.includes('آخر خطأ: لا يوجد'));
+});
+
+test('music duplicate prevention catches identical content hashes, normalized title+duration, and duplicate radio URLs while keeping mobile multi-file picker clean', async () => {
+  // Audio picker accept excludes video/mp4 and video/webm so Android opens file/audio picker instead of empty video gallery
+  assert.equal(AUDIO_PICKER_ACCEPT.includes('video/'), false);
+  assert.equal(AUDIO_PICKER_ACCEPT.includes('.mp4'), false);
+  assert.ok(AUDIO_PICKER_ACCEPT.includes('audio/*'));
+  assert.ok(AUDIO_PICKER_ACCEPT.includes('.mp3'));
+
+  // Directory picker must be disabled on mobile user agents (Android/iPhone), even in Node/DOM
+  assert.equal(
+    supportsDirectorySelection(
+      'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36'
+    ),
+    false
+  );
+  assert.equal(
+    supportsDirectorySelection(
+      'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15'
+    ),
+    false
+  );
+
+  // Extended mobile audio extensions and Ogg MIME
+  assert.equal(isSupportedAudioFile({ name: 'voice.amr', type: '', size: 512 }), true);
+  assert.equal(isSupportedAudioFile({ name: 'memo.3gp', type: '', size: 512 }), true);
+  assert.equal(isSupportedAudioFile({ name: 'track.oga', type: 'application/ogg', size: 512 }), true);
+
+  // Content hashing detects renamed copies of the exact same song
+  const bufA = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]).buffer;
+  const bufB = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 9]).buffer;
+  const hashA = await computeAudioContentHash(bufA);
+  const hashA2 = await computeAudioContentHash(bufA);
+  const hashB = await computeAudioContentHash(bufB);
+  assert.equal(hashA, hashA2);
+  assert.notEqual(hashA, hashB);
+
+  const existing: MusicTrackRecord[] = [
+    {
+      id: 'tr_1',
+      kind: 'file',
+      title: 'أنشودة الصباح',
+      fileName: 'morning.mp3',
+      duration: 120.4,
+      size: 2048,
+      contentHash: hashA,
+      order: 0,
+      missingFile: false,
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    {
+      id: 'rad_1',
+      kind: 'radio',
+      title: 'إذاعة',
+      streamUrl: 'https://Example.COM/stream/',
+      duration: 0,
+      size: 0,
+      order: 1,
+      missingFile: false,
+      createdAt: 2,
+      updatedAt: 2,
+    },
+  ];
+
+  // Renamed duplicate with matching content hash is rejected
+  assert.equal(
+    isDuplicateAudioFile(existing, new Set(), 'morning (1).mp3', 2048, hashA, new Set()),
+    true
+  );
+  // Same batch content hash is also rejected
+  assert.equal(
+    isDuplicateAudioFile([], new Set(), 'copy.mp3', 2048, hashB, new Set([hashB])),
+    true
+  );
+  // Different content hash and filename passes
+  assert.equal(
+    isDuplicateAudioFile(existing, new Set(), 'other.mp3', 2048, hashB, new Set()),
+    false
+  );
+
+  // Normalized title + matching duration within 1s is flagged duplicate; differing duration passes
+  assert.equal(normalizeAudioTitleForDuplicate('  صباح__الخير  '), 'صباح الخير');
+  assert.equal(
+    isDuplicateAudioTitleAndDuration(existing, [], 'أنشودة_الصباح', 120.8),
+    true
+  );
+  assert.equal(
+    isDuplicateAudioTitleAndDuration(existing, [], 'أنشودة_الصباح', 125),
+    false
+  );
+  assert.equal(
+    isDuplicateAudioTitleAndDuration(
+      [],
+      [{ titleNorm: 'نغمة هادئة', duration: 45 }],
+      'نغمة-هادئة',
+      45.2
+    ),
+    true
+  );
+
+  // Radio stream URL deduplication (host case-insensitive & trailing slash ignored)
+  assert.equal(normalizeRadioStreamUrl('https://Example.com/live/'), 'https://example.com/live');
+  assert.equal(isDuplicateRadioStation(existing, 'https://example.com/stream'), true);
+  assert.equal(isDuplicateRadioStation(existing, 'https://example.com/other'), false);
+});

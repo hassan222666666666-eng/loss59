@@ -3,6 +3,8 @@ import {
   DEFAULT_SETTINGS,
   MusicFabColorId,
   NoteItem,
+  PhotoEnhanceLevel,
+  PreviewResolutionSetting,
   ShelfPhoto,
   WhatsAppRecipient,
 } from '../../types';
@@ -27,6 +29,7 @@ export const LEGACY_SETTINGS_AI_FIELDS = [
   'activeShelfLabel',
   'unifiedFraming',
   'musicHideDuringCapture',
+  'duplicateDebugEnabled',
 ] as const;
 
 export interface CleanBackupPayload {
@@ -84,8 +87,28 @@ export function sanitizePhotoRecord(raw: unknown): ShelfPhoto | null {
         : 0,
   };
 
+  if (typeof obj.thumbnailDataUrl === 'string' && obj.thumbnailDataUrl) {
+    clean.thumbnailDataUrl = obj.thumbnailDataUrl;
+  }
+  if (typeof obj.originalDataUrl === 'string' && obj.originalDataUrl) {
+    clean.originalDataUrl = obj.originalDataUrl;
+  }
   if (obj.imageCleaned === true) clean.imageCleaned = true;
   if (typeof obj.done === 'boolean') clean.done = obj.done;
+  if (
+    obj.enhancementStatus === 'pending' ||
+    obj.enhancementStatus === 'enhanced' ||
+    obj.enhancementStatus === 'unenhanced'
+  ) {
+    clean.enhancementStatus = obj.enhancementStatus;
+  }
+  if (
+    obj.enhancementLevel === 'light' ||
+    obj.enhancementLevel === 'medium' ||
+    obj.enhancementLevel === 'strong'
+  ) {
+    clean.enhancementLevel = obj.enhancementLevel;
+  }
 
   return clean;
 }
@@ -128,17 +151,77 @@ export function sanitizeSettingsRecord(
       ? rawFabColor
       : 'violet-pink';
 
+  const validDefaultUnits = new Set(['carton', 'box', 'piece', 'kg', 'gram', 'none']);
+  const rawDefaultUnit = typeof s.noteDefaultUnit === 'string' ? s.noteDefaultUnit : 'none';
+  const noteDefaultUnit = (
+    validDefaultUnits.has(rawDefaultUnit) ? rawDefaultUnit : 'none'
+  ) as AppSettings['noteDefaultUnit'];
+
+  const validEnhanceLevels = new Set<PhotoEnhanceLevel>([
+    'off',
+    'light',
+    'medium',
+    'strong',
+  ]);
+  const rawEnhanceLevel = s.photoEnhanceLevel as PhotoEnhanceLevel | undefined;
+  const photoEnhanceLevel: PhotoEnhanceLevel =
+    rawEnhanceLevel && validEnhanceLevels.has(rawEnhanceLevel)
+      ? rawEnhanceLevel
+      : 'medium';
+
+  const previewResolution: PreviewResolutionSetting =
+    s.previewResolution === '1080p' ||
+    s.previewResolution === '720p' ||
+    s.previewResolution === 'auto'
+      ? s.previewResolution
+      : s.cameraHighQuality === false
+      ? '720p'
+      : 'auto';
+
   return {
     ...DEFAULT_SETTINGS,
     ...s,
+    captureMode: s.captureMode === 'high-quality' ? 'high-quality' : 'fast',
+    previewResolution,
+    previewFrameRate:
+      s.previewFrameRate === 30 ||
+      s.previewFrameRate === 24 ||
+      s.previewFrameRate === 15
+        ? s.previewFrameRate
+        : 24,
+    cameraIdleTimeoutSec:
+      s.cameraIdleTimeoutSec === 30 ||
+      s.cameraIdleTimeoutSec === 60 ||
+      s.cameraIdleTimeoutSec === 120 ||
+      s.cameraIdleTimeoutSec === 0
+        ? s.cameraIdleTimeoutSec
+        : 60,
+    batterySaverMode:
+      s.batterySaverMode === 'off' ||
+      s.batterySaverMode === 'auto' ||
+      s.batterySaverMode === 'always'
+        ? s.batterySaverMode
+        : 'auto',
     selectedCameraDeviceId: normalizedDeviceId,
     cameraHighQuality:
-      s.cameraHighQuality !== undefined ? Boolean(s.cameraHighQuality) : true,
+      previewResolution === '720p'
+        ? false
+        : previewResolution === '1080p'
+        ? true
+        : s.cameraHighQuality !== undefined
+        ? Boolean(s.cameraHighQuality)
+        : true,
     cameraToolbarSide: s.cameraToolbarSide === 'left' ? 'left' : 'right',
+    photoEnhanceLevel,
+    enhanceGalleryImports: Boolean(s.enhanceGalleryImports),
+    keepOriginalPhoto: Boolean(s.keepOriginalPhoto),
     defaultNoteQuantities:
       s.defaultNoteQuantities !== undefined
         ? Boolean(s.defaultNoteQuantities)
         : true,
+    autoTakeNoteNumber: Boolean(s.autoTakeNoteNumber),
+    noteUnitMode: s.noteUnitMode === 'fixed' ? 'fixed' : 'per-product',
+    noteDefaultUnit,
     noteCopySortOrder:
       s.noteCopySortOrder === 'alphabetical' ? 'alphabetical' : 'as-written',
     noteCopyDigitStyle:
